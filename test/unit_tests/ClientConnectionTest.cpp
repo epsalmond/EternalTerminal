@@ -36,11 +36,19 @@ class SocketPairHandler : public SocketHandler {
   set<int> getEndpointFds(const SocketEndpoint&) override { return {}; }
   int accept(int fd) override { return fd; }
   void stopListening(const SocketEndpoint&) override {}
-  void close(int fd) override { ::close(fd); }
+  void close(int fd) override {
+    closeCounts[fd]++;
+    ::close(fd);
+  }
   vector<int> getActiveSockets() override { return {}; }
+  int closeCount(int fd) const {
+    auto it = closeCounts.find(fd);
+    return it == closeCounts.end() ? 0 : it->second;
+  }
 
  private:
   std::queue<int> connectQueue;
+  std::map<int, int> closeCounts;
 };
 
 class RecordingServerConnection : public ServerConnection {
@@ -157,10 +165,12 @@ TEST_CASE("ClientConnection surfaces handshake failures",
   });
 
   REQUIRE_FALSE(conn.connect());
-
   server.join();
+
+  REQUIRE(conn.getSocketFd() == -1);
+  REQUIRE(handler->closeCount(fds[0]) == 1);
+
   conn.shutdown();
-  handler->close(fds[0]);
   handler->close(fds[1]);
 }
 

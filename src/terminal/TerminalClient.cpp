@@ -157,6 +157,7 @@ TerminalClient::TerminalClient(
           connection->lastStatus() == et::ConnectStatus::INVALID_KEY) {
         // The server knows this id no longer exists; surface a distinct
         // error so callers can discard the saved session.
+        connection->shutdown();
         throw std::runtime_error(INVALID_SESSION_CONNECT_ERROR);
       }
       if (_exitOnConnectFailure) {
