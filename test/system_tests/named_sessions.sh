@@ -22,6 +22,10 @@ UNNAMED_LOG=$LOG_DIR/unnamed.log
 UNWRITABLE_LIST_LOG=$LOG_DIR/unwritable-list.log
 UNWRITABLE_NAME_LOG=$LOG_DIR/unwritable-name.log
 ATTACH_OPTIONS_LOG=$LOG_DIR/attach-options.log
+KILL_LOG=$LOG_DIR/kill.log
+KILL_ATTACH_LOG=$LOG_DIR/kill-attach.log
+STALE_KILL_LOG=$LOG_DIR/stale-kill.log
+UNREACHABLE_KILL_LOG=$LOG_DIR/unreachable-kill.log
 INPUT_FIFO=$LOG_DIR/input_fifo
 ATTACH_FIFO=$LOG_DIR/attach_fifo
 
@@ -72,6 +76,15 @@ wait_for_grep() { # pattern, file, seconds
     sleep 0.1
   done
   echo "timed out waiting for '$1' in $2" >&2
+  return 1
+}
+
+wait_for_process_exit() { # pid, seconds
+  for _ in $(seq 1 "$(( $2 * 10 ))"); do
+    kill -0 "$1" 2>/dev/null || return 0
+    sleep 0.1
+  done
+  echo "timed out waiting for process $1 to exit" >&2
   return 1
 }
 
@@ -260,16 +273,51 @@ wait_for_file "$TEST_HOME/.et/sessions/alpha" 30
 printf 'if [ -z "${ET_SENTINEL+x}" ]; then echo FRESH-UNSET; else echo FRESH-SET; fi\n' >&10
 wait_for_grep 'FRESH-UNSET' "$RECREATE_LOG" 30
 
-printf 'exit\n' >&10
-for _ in $(seq 1 100); do
-  [ ! -f "$TEST_HOME/.et/sessions/alpha" ] && break
-  sleep 0.1
-done
+# Preserve the live credentials for stale and unreachable follow-up cases,
+# then terminate the session from a separate client. A unique
+# case-insensitive substring resolves the same way as --attach.
+cp -p "$TEST_HOME/.et/sessions/alpha" "$LOG_DIR/alpha.kill-stale"
+terminal_pid=$(pgrep -f "etterminal.*--serverfifo=$ET_FIFO" | tail -n 1)
+HOME=$TEST_HOME build/et --kill LPH >"$KILL_LOG" 2>&1
+grep -F -q "Killed session 'alpha'" "$KILL_LOG"
+wait_for_process_exit "$terminal_pid" 30
 [ ! -f "$TEST_HOME/.et/sessions/alpha" ] || {
-  echo "fresh session file not removed after clean exit" >&2
+  echo "--kill did not remove the live session file" >&2
   exit 1
 }
 wait "$attach_pid" 2>/dev/null || true
 attach_pid=""
+
+if HOME=$TEST_HOME build/et --attach alpha >"$KILL_ATTACH_LOG" 2>&1; then
+  echo "--attach found a killed session" >&2
+  exit 1
+fi
+grep -F -q "No saved session named 'alpha'" "$KILL_ATTACH_LOG"
+
+# Restoring the ended session's credentials makes a stale local record. The
+# server's INVALID_KEY response removes it successfully.
+cp -p "$LOG_DIR/alpha.kill-stale" "$TEST_HOME/.et/sessions/alpha"
+HOME=$TEST_HOME build/et --kill alpha >"$STALE_KILL_LOG" 2>&1
+grep -F -q "Session 'alpha' was already gone; removed stale record" \
+  "$STALE_KILL_LOG"
+[ ! -f "$TEST_HOME/.et/sessions/alpha" ]
+
+# An unreachable endpoint must retain the record for a later retry.
+cp -p "$LOG_DIR/alpha.kill-stale" "$TEST_HOME/.et/sessions/unreachable"
+sed -i 's/^name=alpha$/name=unreachable/' \
+  "$TEST_HOME/.et/sessions/unreachable"
+sed -i "s/^port=$ET_PORT$/port=$((ET_PORT + 1))/" \
+  "$TEST_HOME/.et/sessions/unreachable"
+if HOME=$TEST_HOME build/et --kill unreachable \
+  >"$UNREACHABLE_KILL_LOG" 2>&1; then
+  echo "--kill unexpectedly succeeded for an unreachable host" >&2
+  exit 1
+fi
+grep -F -q "Could not reach the ET server: localhost:$((ET_PORT + 1))" \
+  "$UNREACHABLE_KILL_LOG"
+grep -F -q "Session 'unreachable' was not removed; retry --kill or delete ~/.et/sessions/unreachable manually" \
+  "$UNREACHABLE_KILL_LOG"
+[ -f "$TEST_HOME/.et/sessions/unreachable" ]
+rm "$TEST_HOME/.et/sessions/unreachable"
 
 echo "named_sessions.sh: OK"

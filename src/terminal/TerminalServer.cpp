@@ -259,6 +259,7 @@ void TerminalServer::runTerminal(
   el::Helpers::setThreadName(serverClientState->getId());
   // Whether the TE should keep running.
   bool run = true;
+  bool killRequested = false;
 
   // TE sends/receives data to/from the shell one char at a time.
   char b[BUF_SIZE];
@@ -344,6 +345,10 @@ void TerminalServer::runTerminal(
               Packet(TerminalPacketType::TERMINAL_BUFFER, protoToString(tb)));
         } else if (rc == 0) {
           LOG(INFO) << "Terminal session ended";
+          if (killRequested) {
+            serverClientState->writePacket(
+                Packet(TerminalPacketType::KEEP_ALIVE, SESSION_KILL_ACK));
+          }
           run = false;
           break;
         } else if ((errno == EAGAIN) || (errno == EWOULDBLOCK)) {
@@ -413,6 +418,10 @@ void TerminalServer::runTerminal(
               LOG(INFO) << "Got terminal info";
               et::TerminalInfo ti =
                   stringToProto<et::TerminalInfo>(packet.getPayload());
+              if (ti.command() == TerminalInfo::KILL_SESSION &&
+                  ti.commandversion() == SESSION_KILL_COMMAND_VERSION) {
+                killRequested = true;
+              }
               char c = TERMINAL_INFO;
               terminalSocketHandler->writeAllOrThrow(terminalFd, &c,
                                                      sizeof(char), false);

@@ -160,6 +160,17 @@ struct SessionFixture {
     }
   }
 
+  void detachClient() {
+    if (!client) {
+      return;
+    }
+    client->shutdown();
+    if (clientThread.joinable()) {
+      clientThread.join();
+    }
+    client.reset();
+  }
+
   string id;
   string passkey;
   shared_ptr<PipeSocketHandler> consoleSocketHandler;
@@ -210,6 +221,12 @@ class RealPtyCatTerminal : public UserTerminal {
   }
   virtual void runTerminal() {}
   virtual void handleSessionEnd() {}
+  virtual void terminate() {
+    const pid_t pid = childPid.load();
+    if (pid > 0) {
+      kill(pid, SIGHUP);
+    }
+  }
   virtual void cleanup() {
     if (masterFd >= 0) {
       close(masterFd);
@@ -486,6 +503,38 @@ TEST_CASE("TerminalClientPersistsOscTitle", "[RouterRestart]") {
       },
       10, "saved terminal title");
   REQUIRE(session.console->getTerminalData(output.size()) == output);
+
+  session.stop();
+  target.kill();
+  FATAL_FAIL(::remove((pipeDirectory + "/pipe_server").c_str()));
+  FATAL_FAIL(::remove((pipeDirectory + "/pipe_router").c_str()));
+  FATAL_FAIL(::remove(pipeDirectory.c_str()));
+}
+
+TEST_CASE("TerminalClientKillsDetachedSession", "[RouterRestart]") {
+  const string pipeDirectory = makePipeDir();
+  RestartableServer target;
+  target.serverEndpoint.set_name(pipeDirectory + "/pipe_server");
+  target.routerEndpoint.set_name(pipeDirectory + "/pipe_router");
+  target.start();
+
+  SessionFixture session;
+  session.start(target);
+  session.detachClient();
+
+  auto socketHandler = make_shared<PipeSocketHandler>();
+  auto pipeSocketHandler = make_shared<PipeSocketHandler>();
+  TerminalClient killer(
+      socketHandler, pipeSocketHandler, target.serverEndpoint, session.id,
+      session.passkey, /*console=*/nullptr, false, "", "", false, "",
+      MAX_CLIENT_KEEP_ALIVE_DURATION, vector<pair<string, string>>(),
+      /*maxConnectAttempts=*/3, /*exitOnConnectFailure=*/false);
+  REQUIRE(killer.killSession(10));
+  requireEventually([&]() { return session.userTerminal->sessionEndHandled(); },
+                    10, "terminal session end after kill");
+  requireEventually(
+      [&]() { return !target.server->clientConnectionExists(session.id); }, 10,
+      "server key removal after kill");
 
   session.stop();
   target.kill();

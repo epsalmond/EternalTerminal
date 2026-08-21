@@ -31,7 +31,7 @@ class PseudoUserTerminal : public UserTerminal {
   virtual ~PseudoUserTerminal() {}
 
   virtual int setup(int routerFd) {
-    pid_t pid = forkpty(&masterFd, NULL, NULL, NULL);
+    pid = forkpty(&masterFd, NULL, NULL, NULL);
     switch (pid) {
       case -1:
         FATAL_FAIL(pid);
@@ -121,6 +121,18 @@ class PseudoUserTerminal : public UserTerminal {
       }
     }
 #endif
+  }
+
+  virtual void terminate() {
+    if (getPid() <= 0) {
+      return;
+    }
+    // forkpty creates a session/process group led by the shell. Signal the
+    // group so background descendants do not keep the session alive.
+    if (::kill(-getPid(), SIGHUP) == -1 && errno != ESRCH) {
+      LOG(ERROR) << "Could not terminate terminal process group: "
+                 << strerror(errno);
+    }
   }
 
   /**
