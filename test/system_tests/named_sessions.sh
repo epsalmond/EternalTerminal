@@ -16,6 +16,7 @@ ATTACH_LOG=$LOG_DIR/attach.log
 NAME_LOG=$LOG_DIR/name.log
 MISMATCH_LOG=$LOG_DIR/mismatch.log
 RECREATE_LOG=$LOG_DIR/recreate.log
+AMBIGUOUS_LOG=$LOG_DIR/ambiguous.log
 INPUT_FIFO=$LOG_DIR/input_fifo
 ATTACH_FIFO=$LOG_DIR/attach_fifo
 
@@ -84,8 +85,25 @@ printf 'ET_SENTINEL=abc123\n' >&9
 printf 'echo PRE-$((6*7))\n' >&9
 wait_for_grep 'PRE-42' "$CLIENT_LOG" 30
 
+# Record an OSC 2 title without changing the bytes rendered by the client.
+printf 'printf "\\033]2;ET_TITLE_TEST\\007"\n' >&9
+wait_for_grep '^title=ET_TITLE_TEST$' "$TEST_HOME/.et/sessions/alpha" 30
+
 # A connected client keeps the session fresh for the offline list.
-HOME=$TEST_HOME build/et --list | grep -E -q 'alpha.*now'
+HOME=$TEST_HOME build/et --list | grep -E -q 'alpha.*ET_TITLE_TEST.*now'
+
+# A title substring must be unique. Duplicate the record with a valid second
+# name so this local-only resolution path cannot accidentally connect.
+cp -p "$TEST_HOME/.et/sessions/alpha" "$TEST_HOME/.et/sessions/beta"
+sed -i 's/^name=alpha$/name=beta/' "$TEST_HOME/.et/sessions/beta"
+if HOME=$TEST_HOME build/et --attach TITLE_TEST >"$AMBIGUOUS_LOG" 2>&1; then
+  echo "ambiguous title unexpectedly attached" >&2
+  exit 1
+fi
+grep -F -q "Multiple saved sessions match 'TITLE_TEST':" "$AMBIGUOUS_LOG"
+grep -F -q 'alpha [ET_TITLE_TEST]' "$AMBIGUOUS_LOG"
+grep -F -q 'beta [ET_TITLE_TEST]' "$AMBIGUOUS_LOG"
+rm "$TEST_HOME/.et/sessions/beta"
 
 # Simulate a laptop reboot: SIGKILL the client (the script wrapper and the
 # et process under it).  The session file must stay.
@@ -105,7 +123,7 @@ touch -d '5 minutes ago' "$TEST_HOME/.et/sessions/alpha"
 HOME=$TEST_HOME build/et --list | grep -E -q 'alpha.*5m ago'
 
 # --attach reattaches to the same remote shell: the sentinel is still set.
-HOME=$TEST_HOME script -qec "build/et --attach alpha --serverfifo=$ET_FIFO \
+HOME=$TEST_HOME script -qec "build/et --attach TITLE_TEST --serverfifo=$ET_FIFO \
   --terminal-path $PWD/build/etterminal --logtostdout" /dev/null \
   <"$ATTACH_FIFO" >"$ATTACH_LOG" 2>&1 &
 attach_pid=$!
@@ -117,7 +135,7 @@ wait_for_grep 'POST-abc123' "$ATTACH_LOG" 30
 # of rejecting the existing name.
 pkill -9 -P "$attach_pid" 2>/dev/null || true
 kill -9 "$attach_pid" 2>/dev/null || true
-pkill -9 -f "build/et --attach alpha" 2>/dev/null || true
+pkill -9 -f "build/et --attach TITLE_TEST" 2>/dev/null || true
 wait "$attach_pid" 2>/dev/null || true
 attach_pid=""
 

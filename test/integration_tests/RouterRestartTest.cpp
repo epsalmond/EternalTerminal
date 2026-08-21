@@ -6,6 +6,7 @@
 // and then binding a brand new TerminalServer on the same pipe paths.
 #include <atomic>
 #include <chrono>
+#include <filesystem>
 #include <functional>
 
 #if __APPLE__
@@ -21,6 +22,7 @@
 
 #include "FakeConsole.hpp"
 #include "FakeSshSetupHandler.hpp"
+#include "SessionStore.hpp"
 #include "TerminalClient.hpp"
 #include "TerminalServer.hpp"
 #include "TestHeaders.hpp"
@@ -100,7 +102,8 @@ struct SessionFixture {
     }
   }
 
-  void start(RestartableServer& target) {
+  void start(RestartableServer& target,
+             std::function<bool(const string&)> sessionTitleUpdate = {}) {
     auto fakeSubprocessUtils = make_shared<FakeSubprocessUtils>();
     auto sshSetupHandler =
         make_shared<FakeSshSetupHandler>(fakeSubprocessUtils);
@@ -124,7 +127,9 @@ struct SessionFixture {
     client = shared_ptr<TerminalClient>(new TerminalClient(
         clientSocketHandler, clientPipeSocketHandler, target.serverEndpoint, id,
         passkey, console, false, "", "", false, "",
-        MAX_CLIENT_KEEP_ALIVE_DURATION, vector<pair<string, string>>()));
+        MAX_CLIENT_KEEP_ALIVE_DURATION, vector<pair<string, string>>(),
+        /*maxConnectAttempts=*/3, /*exitOnConnectFailure=*/true,
+        /*sessionHeartbeat=*/{}, sessionTitleUpdate));
     clientThread = thread([this]() { client->run("", false); });
 
     requireEventually([this]() { return console->isSetup(); }, 30,
@@ -331,6 +336,30 @@ string makePipeDir() {
   return string(mkdtemp(&tmpPath[0]));
 }
 
+struct ScopedTestHome {
+  ScopedTestHome() {
+    const char* currentHome = getenv("HOME");
+    if (currentHome) {
+      previousHome = currentHome;
+    }
+    path = makePipeDir();
+    ::setenv("HOME", path.c_str(), 1);
+  }
+
+  ~ScopedTestHome() {
+    if (previousHome) {
+      ::setenv("HOME", previousHome->c_str(), 1);
+    } else {
+      ::unsetenv("HOME");
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(path, ec);
+  }
+
+  optional<string> previousHome;
+  string path;
+};
+
 }  // namespace
 
 TEST_CASE("RouterRestartSurvival", "[RouterRestart]") {
@@ -368,6 +397,46 @@ TEST_CASE("RouterRestartSurvival", "[RouterRestart]") {
   REQUIRE(session.userTerminal->getKeystrokes(1) == "b");
   session.userTerminal->simulateTerminalResponse("R");
   REQUIRE(session.console->getTerminalData(1) == "R");
+
+  session.stop();
+  target.kill();
+  FATAL_FAIL(::remove((pipeDirectory + "/pipe_server").c_str()));
+  FATAL_FAIL(::remove((pipeDirectory + "/pipe_router").c_str()));
+  FATAL_FAIL(::remove(pipeDirectory.c_str()));
+}
+
+TEST_CASE("TerminalClientPersistsOscTitle", "[RouterRestart]") {
+  ScopedTestHome home;
+  const string pipeDirectory = makePipeDir();
+  RestartableServer target;
+  target.serverEndpoint.set_name(pipeDirectory + "/pipe_server");
+  target.routerEndpoint.set_name(pipeDirectory + "/pipe_router");
+  target.start();
+
+  SessionFixture session;
+  session.start(target, [](const string& title) {
+    return updateSessionTitle("alpha", title);
+  });
+  SessionInfo info;
+  info.name = "alpha";
+  info.host = "localhost";
+  info.port = 2022;
+  info.id = session.id;
+  info.passkey = session.passkey;
+  info.title = "";
+  info.savedAt = static_cast<int64_t>(time(NULL));
+  info.lastSeenAt = 0;
+  saveSession(info);
+
+  const string output = "\033]2;Integrated Title\007";
+  session.userTerminal->simulateTerminalResponse(output);
+  requireEventually(
+      []() {
+        const optional<SessionInfo> saved = loadSession("alpha");
+        return saved && saved->title == "Integrated Title";
+      },
+      10, "saved terminal title");
+  REQUIRE(session.console->getTerminalData(output.size()) == output);
 
   session.stop();
   target.kill();

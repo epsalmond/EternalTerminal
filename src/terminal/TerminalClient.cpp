@@ -18,11 +18,13 @@ TerminalClient::TerminalClient(
     const string& tunnels, const string& reverseTunnels, bool forwardSshAgent,
     const string& identityAgent, int _keepaliveDuration,
     const vector<pair<string, string>>& envVars, int _maxConnectAttempts,
-    bool _exitOnConnectFailure, std::function<bool()> _sessionHeartbeat)
+    bool _exitOnConnectFailure, std::function<bool()> _sessionHeartbeat,
+    std::function<bool(const string&)> _sessionTitleUpdate)
     : console(_console),
       shuttingDown(false),
       keepaliveDuration(_keepaliveDuration),
-      sessionHeartbeat(_sessionHeartbeat) {
+      sessionHeartbeat(_sessionHeartbeat),
+      sessionTitleUpdate(_sessionTitleUpdate) {
   portForwardHandler = shared_ptr<PortForwardHandler>(
       new PortForwardHandler(_socketHandler, _pipeSocketHandler));
   InitialPayload payload;
@@ -192,6 +194,10 @@ void TerminalClient::run(const string& command, const bool noexit) {
   bool waitingOnKeepalive = false;
   time_t sessionHeartbeatTime = time(NULL);
   bool sessionHeartbeatWarningLogged = false;
+  time_t sessionTitleUpdateTime = time(NULL);
+  bool sessionTitleWarningLogged = false;
+  optional<string> currentSessionTitle;
+  optional<string> pendingSessionTitle;
 
   if (command.length()) {
     LOG(INFO) << "Got command: " << command;
@@ -378,6 +384,14 @@ void TerminalClient::run(const string& command, const bool noexit) {
           }
         }
         if (console && !coalesced.empty()) {
+          if (sessionTitleUpdate) {
+            const optional<string> parsedTitle = titleParser.parse(coalesced);
+            if (parsedTitle && (!currentSessionTitle ||
+                                *parsedTitle != *currentSessionTitle)) {
+              currentSessionTitle = parsedTitle;
+              pendingSessionTitle = parsedTitle;
+            }
+          }
           console->write(coalesced);
         }
       }
@@ -443,6 +457,22 @@ void TerminalClient::run(const string& command, const bool noexit) {
           sessionHeartbeatWarningLogged = true;
         }
         sessionHeartbeatTime = now + 15;
+      }
+      if (sessionTitleUpdate && pendingSessionTitle &&
+          connection->getSocketFd() > 0 && sessionTitleUpdateTime <= now) {
+        bool updateSucceeded = false;
+        try {
+          updateSucceeded = sessionTitleUpdate(*pendingSessionTitle);
+        } catch (...) {
+          // Session persistence is best-effort and must not end a connection.
+        }
+        if (updateSucceeded) {
+          pendingSessionTitle.reset();
+        } else if (!sessionTitleWarningLogged) {
+          LOG(WARNING) << "Could not update saved session title";
+          sessionTitleWarningLogged = true;
+        }
+        sessionTitleUpdateTime = now + 2;
       }
     } catch (const runtime_error& re) {
       STERROR << "Error: " << re.what();

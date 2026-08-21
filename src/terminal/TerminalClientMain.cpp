@@ -54,6 +54,34 @@ T extractSingleOptionWithDefault(const cxxopts::ParseResult& result,
 
 enum class AttachResult { ATTACHED, INVALID_SESSION, FAILED };
 
+string lowercaseAscii(string value) {
+  transform(value.begin(), value.end(), value.begin(),
+            [](unsigned char c) { return static_cast<char>(tolower(c)); });
+  return value;
+}
+
+string displayTitle(const string& title) {
+  if (title.empty()) {
+    return "-";
+  }
+  constexpr size_t kMaxDisplayBytes = 32;
+  constexpr size_t kEllipsisBytes = 3;
+  if (title.size() <= kMaxDisplayBytes) {
+    return title;
+  }
+  size_t keep = kMaxDisplayBytes - kEllipsisBytes;
+  while (keep > 0 && (static_cast<unsigned char>(title[keep]) & 0xc0) == 0x80) {
+    --keep;
+  }
+  return title.substr(0, keep) + "…";
+}
+
+void printSessionCandidate(const SessionInfo& session) {
+  CLOG(INFO, "stdout") << "  " << session.name << " ["
+                       << displayTitle(session.title) << "] (" << session.host
+                       << ":" << session.port << ")" << endl;
+}
+
 AttachResult attachSavedSession(const string& name, const SessionInfo& session,
                                 const string& command, bool noexit,
                                 bool noTerminal, int keepaliveDuration) {
@@ -80,8 +108,10 @@ AttachResult attachSavedSession(const string& name, const SessionInfo& session,
         /*jumphost=*/false, /*tunnels=*/"", /*reverseTunnels=*/"",
         /*forwardSshAgent=*/false, /*identityAgent=*/"", keepaliveDuration,
         /*envVars=*/{}, /*maxConnectAttempts=*/15,
-        /*exitOnConnectFailure=*/false,
-        [name]() { return touchSession(name); });
+        /*exitOnConnectFailure=*/false, [name]() { return touchSession(name); },
+        [name](const string& title) {
+          return updateSessionTitle(name, title);
+        });
     client.run(command, noexit);
     sessionEnded = client.sessionEndedByServer();
   } catch (const runtime_error& err) {
@@ -240,7 +270,7 @@ int main(int argc, char** argv) {
          cxxopts::value<bool>()->default_value("true"))  //
         ("name", "Name this session so it can be reattached later",
          cxxopts::value<std::string>())  //
-        ("attach", "Reattach to a previously named session",
+        ("attach", "Reattach by session name or unique title substring",
          cxxopts::value<std::string>())           //
         ("list", "List saved sessions and exit")  //
         ("serverfifo",
@@ -264,11 +294,13 @@ int main(int argc, char** argv) {
 
     if (result.count("list")) {
       // Local-only operation: no connection is made.
-      CLOG(INFO, "stdout") << left << setw(24) << "NAME" << setw(24) << "HOST"
-                           << setw(8) << "PORT" << "LAST SEEN" << endl;
+      CLOG(INFO, "stdout") << left << setw(24) << "NAME" << setw(34) << "TITLE"
+                           << setw(24) << "HOST" << setw(8) << "PORT"
+                           << "LAST SEEN" << endl;
       const int64_t now = static_cast<int64_t>(time(NULL));
       for (const auto& session : listSessions()) {
-        CLOG(INFO, "stdout") << left << setw(24) << session.name << setw(24)
+        CLOG(INFO, "stdout") << left << setw(24) << session.name << setw(34)
+                             << displayTitle(session.title) << setw(24)
                              << session.host << setw(8) << session.port
                              << formatLastSeen(session.lastSeenAt, now) << endl;
       }
@@ -311,21 +343,46 @@ int main(int argc, char** argv) {
       // Reattach to a previously named session. The server-side session
       // (terminal + router entry) outlived the client, so skip ssh bootstrap
       // and connect straight to the saved endpoint with the saved id/key.
-      const string attachName = result["attach"].as<string>();
-      if (!isValidSessionName(attachName)) {
-        CLOG(INFO, "stdout") << "Invalid session name: " << attachName << endl;
-        exit(1);
+      const string attachQuery = result["attach"].as<string>();
+      const vector<SessionInfo> savedSessions = listSessions();
+      optional<SessionInfo> session;
+      for (const auto& candidate : savedSessions) {
+        if (candidate.name == attachQuery) {
+          session = candidate;
+          break;
+        }
       }
-      optional<SessionInfo> session = loadSession(attachName);
+
+      if (!session && !attachQuery.empty()) {
+        const string query = lowercaseAscii(attachQuery);
+        vector<SessionInfo> matches;
+        for (const auto& candidate : savedSessions) {
+          if (lowercaseAscii(candidate.name).find(query) != string::npos ||
+              lowercaseAscii(candidate.title).find(query) != string::npos) {
+            matches.push_back(candidate);
+          }
+        }
+        if (matches.size() == 1) {
+          session = matches.front();
+        } else if (matches.size() > 1) {
+          CLOG(INFO, "stdout") << "Multiple saved sessions match '"
+                               << attachQuery << "':" << endl;
+          for (const auto& candidate : matches) {
+            printSessionCandidate(candidate);
+          }
+          exit(1);
+        }
+      }
+
       if (!session) {
         CLOG(INFO, "stdout")
-            << "No saved session named '" << attachName << "'" << endl;
-        for (const auto& s : listSessions()) {
-          CLOG(INFO, "stdout") << "  " << s.name << " (" << s.host << ":"
-                               << s.port << ")" << endl;
+            << "No saved session named '" << attachQuery << "'" << endl;
+        for (const auto& candidate : savedSessions) {
+          printSessionCandidate(candidate);
         }
         exit(1);
       }
+      const string attachName = session->name;
 
       int attachKeepalive = extractSingleOptionWithDefault<int>(
           result, options, "keepalive", MAX_CLIENT_KEEP_ALIVE_DURATION);
@@ -625,6 +682,9 @@ int main(int argc, char** argv) {
         /*maxConnectAttempts=*/3, /*exitOnConnectFailure=*/true,
         [&sessionName]() {
           return sessionName.empty() || touchSession(sessionName);
+        },
+        [&sessionName](const string& title) {
+          return sessionName.empty() || updateSessionTitle(sessionName, title);
         });
 
     // The connection is up: persist the session so a rebooted or killed

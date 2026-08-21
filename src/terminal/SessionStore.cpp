@@ -87,7 +87,7 @@ void saveSession(const SessionInfo& info) {
   }
   if (!isPrintableNoBreaks(info.host) || !isPrintableNoBreaks(info.id) ||
       !isPrintableNoBreaks(info.passkey) || info.port <= 0 ||
-      info.port > 65535) {
+      info.port > 65535 || info.title.find_first_of("\r\n") != string::npos) {
     throw std::runtime_error("Session fields must be non-empty and printable");
   }
 
@@ -100,12 +100,12 @@ void saveSession(const SessionInfo& info) {
   const fs::path tmpPath = dir / ("." + info.name + "." + genRandomAlphaNum(8));
   const fs::path finalPath = dir / info.name;
 
-  string contents = string("version=") + kSessionVersion + string("\nname=") +
-                    info.name + string("\nhost=") + info.host +
-                    string("\nport=") + std::to_string(info.port) +
-                    string("\nid=") + info.id + string("\npasskey=") +
-                    info.passkey + string("\nsavedat=") +
-                    std::to_string(info.savedAt) + "\n";
+  string contents =
+      string("version=") + kSessionVersion + string("\nname=") + info.name +
+      string("\nhost=") + info.host + string("\nport=") +
+      std::to_string(info.port) + string("\nid=") + info.id +
+      string("\npasskey=") + info.passkey + string("\nsavedat=") +
+      std::to_string(info.savedAt) + string("\ntitle=") + info.title + "\n";
   {
     std::ofstream out(tmpPath, std::ios::binary | std::ios::trunc);
     if (!out) {
@@ -177,6 +177,8 @@ optional<SessionInfo> loadSession(const string& name) {
     } else if (key == "savedat") {
       info.savedAt = std::stoll(value);
       haveSavedAt = true;
+    } else if (key == "title") {
+      info.title = value;
     }
   }
 
@@ -208,6 +210,20 @@ bool touchSession(const string& name) {
 #else
   return ::utime(path.c_str(), nullptr) == 0;
 #endif
+}
+
+bool updateSessionTitle(const string& name, const string& title) {
+  try {
+    optional<SessionInfo> info = loadSession(name);
+    if (!info) {
+      return false;
+    }
+    info->title = title;
+    saveSession(*info);
+  } catch (...) {
+    return false;
+  }
+  return true;
 }
 
 string formatLastSeen(int64_t lastSeenAt, int64_t now) {

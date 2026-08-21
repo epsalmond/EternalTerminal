@@ -97,6 +97,7 @@ SessionInfo makeInfo(const string& name, const string& host = "nas",
   info.port = port;
   info.id = id;
   info.passkey = passkey;
+  info.title = "";
   info.savedAt = 1755645600;
   info.lastSeenAt = 0;
   return info;
@@ -128,7 +129,9 @@ TEST_CASE("SessionStore save/load round trip", "[SessionStore]") {
 
   const SessionInfo info =
       makeInfo("alpha", "10.0.0.5", 9922, "id-abc", string(32, 'p'));
-  saveSession(info);
+  SessionInfo titledInfo = info;
+  titledInfo.title = "Claude Code - router recovery";
+  saveSession(titledInfo);
 
   const optional<SessionInfo> loaded = loadSession("alpha");
   REQUIRE(loaded.has_value());
@@ -137,8 +140,47 @@ TEST_CASE("SessionStore save/load round trip", "[SessionStore]") {
   REQUIRE(loaded->port == 9922);
   REQUIRE(loaded->id == "id-abc");
   REQUIRE(loaded->passkey == string(32, 'p'));
+  REQUIRE(loaded->title == "Claude Code - router recovery");
   REQUIRE(loaded->savedAt == 1755645600);
   REQUIRE(loaded->lastSeenAt > 0);
+}
+
+TEST_CASE("SessionStore loads version 1 files without a title",
+          "[SessionStore]") {
+  TestEnvironment env;
+  const string home = env.setHomeDir(env.createTempDir());
+  const string dir = home + "/.et/sessions";
+  REQUIRE(std::filesystem::create_directories(dir));
+
+  FILE* f = fopen((dir + "/legacy").c_str(), "w");
+  REQUIRE(f != nullptr);
+  fprintf(f,
+          "version=1\nname=legacy\nhost=nas\nport=2022\nid=old-id\n"
+          "passkey=kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk\nsavedat=1755645600\n");
+  fclose(f);
+
+  const optional<SessionInfo> loaded = loadSession("legacy");
+  REQUIRE(loaded.has_value());
+  REQUIRE(loaded->title.empty());
+}
+
+TEST_CASE("SessionStore updates only the saved title", "[SessionStore]") {
+  TestEnvironment env;
+  env.setHomeDir(env.createTempDir());
+  const SessionInfo original =
+      makeInfo("alpha", "10.0.0.5", 9922, "id-abc", string(32, 'p'));
+  saveSession(original);
+
+  REQUIRE(updateSessionTitle("alpha", "new title"));
+  const optional<SessionInfo> loaded = loadSession("alpha");
+  REQUIRE(loaded.has_value());
+  REQUIRE(loaded->title == "new title");
+  REQUIRE(loaded->host == original.host);
+  REQUIRE(loaded->port == original.port);
+  REQUIRE(loaded->id == original.id);
+  REQUIRE(loaded->passkey == original.passkey);
+  REQUIRE(loaded->savedAt == original.savedAt);
+  REQUIRE_FALSE(updateSessionTitle("missing", "title"));
 }
 
 TEST_CASE("SessionStore touch updates last seen time", "[SessionStore]") {
