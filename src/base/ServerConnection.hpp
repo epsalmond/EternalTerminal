@@ -52,6 +52,8 @@ class ServerConnection {
   inline void addClientKey(const string& id, const string& passkey) {
     lock_guard<std::recursive_mutex> guard(classMutex);
     clientKeys[id] = passkey;
+    // A re-registered id is live again: it must not be reported as ended.
+    removedClientIds.erase(id);
   }
 
   /**
