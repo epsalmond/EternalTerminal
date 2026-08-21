@@ -54,6 +54,17 @@ T extractSingleOptionWithDefault(const cxxopts::ParseResult& result,
 
 enum class AttachResult { ATTACHED, INVALID_SESSION, FAILED };
 
+bool deleteSavedSession(const string& name) {
+  try {
+    deleteSession(name);
+    return true;
+  } catch (const std::exception& e) {
+    CLOG(INFO, "stdout") << "Warning: Could not delete saved session '" << name
+                         << "': " << e.what() << endl;
+    return false;
+  }
+}
+
 string lowercaseAscii(string value) {
   transform(value.begin(), value.end(), value.begin(),
             [](unsigned char c) { return static_cast<char>(tolower(c)); });
@@ -124,7 +135,7 @@ AttachResult attachSavedSession(const string& name, const SessionInfo& session,
   }
 
   if (sessionEnded) {
-    deleteSession(name);
+    deleteSavedSession(name);
   }
   return AttachResult::ATTACHED;
 }
@@ -241,7 +252,7 @@ int main(int argc, char** argv) {
         ("r,reversetunnel",
          "Reverse Tunnel: Same syntax as -t/--tunnel but reversed.",
          cxxopts::value<std::string>())  //
-        ("jumphost", "jumphost between localhost and destination",
+        ("j,jumphost", "jumphost between localhost and destination",
          cxxopts::value<std::string>())  //
         ("jport", "Jumphost machine port",
          cxxopts::value<int>()->default_value("2022"))  //
@@ -312,6 +323,15 @@ int main(int argc, char** argv) {
       CLOG(INFO, "stdout") << "--attach takes a session name; it cannot be "
                               "combined with --name or a host"
                            << endl;
+      exit(1);
+    }
+    if (result.count("attach") &&
+        (result.count("tunnel") || result.count("reversetunnel") ||
+         result.count("forward-ssh-agent") || result.count("jumphost"))) {
+      CLOG(INFO, "stdout")
+          << "--attach cannot be combined with -t, -r, -f, or -j; reconnect "
+             "without --attach to establish forwarding or a jumphost"
+          << endl;
       exit(1);
     }
 
@@ -391,7 +411,7 @@ int main(int argc, char** argv) {
           result.count("command") ? result["command"].as<string>() : "",
           result.count("noexit"), result.count("N"), attachKeepalive);
       if (attachResult == AttachResult::INVALID_SESSION) {
-        deleteSession(attachName);
+        deleteSavedSession(attachName);
         CLOG(INFO, "stdout")
             << "Session '" << attachName << "' is no longer running on "
             << session->host << endl;
@@ -487,8 +507,7 @@ int main(int argc, char** argv) {
       free(home_dir);
     }
 
-    // Every session gets a name so it can be reattached after the client
-    // (or machine) restarts: explicit --name, or a host+timestamp default.
+    // Only explicitly named sessions persist credentials for reattachment.
     optional<SessionInfo> namedSession;
     if (result.count("name")) {
       sessionName = result["name"].as<string>();
@@ -496,25 +515,14 @@ int main(int argc, char** argv) {
         CLOG(INFO, "stdout") << "Invalid session name: " << sessionName << endl;
         exit(1);
       }
-      namedSession = loadSession(sessionName);
-    } else {
-      char ts[32];
-      time_t now = time(NULL);
-      struct tm localTm;
-      localtime_r(&now, &localTm);
-      strftime(ts, sizeof(ts), "%Y%m%d-%H%M%S", &localTm);
-      // Hosts can contain characters that are invalid in session names
-      // (colons in IPv6 literals, etc.); map them to '-'.
-      string safeHost = destinationHost;
-      for (auto& c : safeHost) {
-        if (!isalnum(c) && c != '.' && c != '_' && c != '-') {
-          c = '-';
-        }
+      try {
+        namedSession = loadSession(sessionName);
+      } catch (const std::exception& e) {
+        CLOG(INFO, "stdout")
+            << "Warning: Named session storage is unavailable: " << e.what()
+            << ". Continuing without saving this session." << endl;
+        sessionName.clear();
       }
-      if (safeHost.empty()) {
-        safeHost = "session";
-      }
-      sessionName = safeHost + "-" + ts;
     }
 
     // Parse username: cmdline > sshconfig > localuser
@@ -596,7 +604,7 @@ int main(int argc, char** argv) {
         exit(1);
       }
 
-      deleteSession(sessionName);
+      deleteSavedSession(sessionName);
       CLOG(INFO, "stdout") << "Session '" << sessionName
                            << "' is no longer running; creating a fresh session"
                            << endl;
@@ -732,7 +740,7 @@ int main(int argc, char** argv) {
   // console EOF from a closed window, signal, crash — leaves the remote
   // shell running, so the file stays and the session can be reattached.
   if (!sessionName.empty() && sessionEndedByServer) {
-    deleteSession(sessionName);
+    deleteSavedSession(sessionName);
   }
 
   // Uninstall log rotation callback

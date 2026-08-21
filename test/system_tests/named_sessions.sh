@@ -18,12 +18,17 @@ NAME_LOG=$LOG_DIR/name.log
 MISMATCH_LOG=$LOG_DIR/mismatch.log
 RECREATE_LOG=$LOG_DIR/recreate.log
 AMBIGUOUS_LOG=$LOG_DIR/ambiguous.log
+UNNAMED_LOG=$LOG_DIR/unnamed.log
+UNWRITABLE_LIST_LOG=$LOG_DIR/unwritable-list.log
+UNWRITABLE_NAME_LOG=$LOG_DIR/unwritable-name.log
+ATTACH_OPTIONS_LOG=$LOG_DIR/attach-options.log
 INPUT_FIFO=$LOG_DIR/input_fifo
 ATTACH_FIFO=$LOG_DIR/attach_fifo
 
 server_pid=""
 client_pid=""
 attach_pid=""
+aux_pid=""
 
 dump_logs() {
   echo "named_sessions.sh: failure diagnostics (last 60 lines per log)" >&2
@@ -43,6 +48,7 @@ cleanup() {
   trap - EXIT
   [ "$status" -eq 0 ] || dump_logs
   [ -n "$attach_pid" ] && kill -9 "$attach_pid" 2>/dev/null || true
+  [ -n "$aux_pid" ] && kill -9 "$aux_pid" 2>/dev/null || true
   [ -n "$client_pid" ] && kill -9 "$client_pid" 2>/dev/null || true
   [ -n "$server_pid" ] && kill -9 "$server_pid" 2>/dev/null || true
   pkill -9 -f "etterminal.*--serverfifo=$ET_FIFO" 2>/dev/null || true
@@ -82,6 +88,60 @@ mkdir -p "$SERVER_LOG_DIR"
 build/etserver --port $ET_PORT --serverfifo=$ET_FIFO -l "$SERVER_LOG_DIR" &
 server_pid=$!
 sleep 3
+
+# Attach uses only the saved endpoint and credentials. Options that require a
+# fresh SSH bootstrap must fail explicitly instead of being ignored.
+for option in tunnel reverse agent jumphost; do
+  case "$option" in
+    tunnel) args=(-t 18080:80) ;;
+    reverse) args=(-r 18081:81) ;;
+    agent) args=(-f) ;;
+    jumphost) args=(-j localhost) ;;
+  esac
+  if HOME=$TEST_HOME build/et --attach alpha "${args[@]}" \
+    >"$ATTACH_OPTIONS_LOG" 2>&1; then
+    echo "--attach unexpectedly accepted $option options" >&2
+    exit 1
+  fi
+  grep -F -q -- "--attach cannot be combined with -t, -r, -f, or -j" \
+    "$ATTACH_OPTIONS_LOG"
+done
+
+# Unnamed sessions keep their credentials in memory only.
+HOME=$TEST_HOME build/et -N --serverfifo=$ET_FIFO \
+  --terminal-path "$PWD/build/etterminal" --logtostdout \
+  "localhost:$ET_PORT" >"$UNNAMED_LOG" 2>&1 &
+aux_pid=$!
+wait_for_grep 'ET running, feel free to background' "$UNNAMED_LOG" 30
+if [ -d "$TEST_HOME/.et/sessions" ] &&
+  find "$TEST_HOME/.et/sessions" -type f -print -quit | grep -q .; then
+  echo "unnamed session created a saved session file" >&2
+  exit 1
+fi
+kill -9 "$aux_pid" 2>/dev/null || true
+wait "$aux_pid" 2>/dev/null || true
+aux_pid=""
+pkill -9 -f "etterminal.*--serverfifo=$ET_FIFO" 2>/dev/null || true
+
+# Session storage failures are warnings. Listing remains a successful local
+# operation, and --name continues as an unnamed live session.
+RESTRICTED_HOME=$TEST_HOME/restricted
+mkdir "$RESTRICTED_HOME"
+chmod 000 "$RESTRICTED_HOME"
+HOME=$RESTRICTED_HOME build/et --list >"$UNWRITABLE_LIST_LOG" 2>&1
+grep -F -q 'Could not list sessions' "$UNWRITABLE_LIST_LOG"
+HOME=$RESTRICTED_HOME build/et --name unwritable -N \
+  --serverfifo=$ET_FIFO --terminal-path "$PWD/build/etterminal" \
+  --logtostdout "localhost:$ET_PORT" >"$UNWRITABLE_NAME_LOG" 2>&1 &
+aux_pid=$!
+wait_for_grep "Could not save session 'unwritable'" \
+  "$UNWRITABLE_NAME_LOG" 30
+wait_for_grep 'ET running, feel free to background' "$UNWRITABLE_NAME_LOG" 30
+kill -9 "$aux_pid" 2>/dev/null || true
+wait "$aux_pid" 2>/dev/null || true
+aux_pid=""
+pkill -9 -f "etterminal.*--serverfifo=$ET_FIFO" 2>/dev/null || true
+chmod 700 "$RESTRICTED_HOME"
 
 mkfifo "$INPUT_FIFO" "$ATTACH_FIFO"
 # Hold the fifos open so the clients never see EOF on stdin.
