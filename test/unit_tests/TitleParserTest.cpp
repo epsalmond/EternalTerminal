@@ -49,7 +49,7 @@ TEST_CASE("TitleParser removes C1 controls without damaging UTF-8",
 
   const string title =
       "cl\xC3\xA9"  // valid U+00E9
-      "\xC2\x80"     // encoded U+0080 control
+      "\xC2\x80"    // encoded U+0080 control
       "ok"
       "\xC2\x9F"           // encoded U+009F control
       " \xF0\x9F\x98\x80"  // valid U+1F600
