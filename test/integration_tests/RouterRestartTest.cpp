@@ -453,7 +453,9 @@ TEST_CASE("RouterReregistrationSurvivesWithLiveServer", "[RouterRestart]") {
       30, "replacement terminal registration");
   requireEventually(
       [&]() {
-        return target.server->getClientConnection(session.id) != oldConnection;
+        const shared_ptr<ServerClientConnection> connection =
+            target.server->tryGetClientConnection(session.id);
+        return connection && connection != oldConnection;
       },
       30, "client reconnect to replacement terminal pump");
 

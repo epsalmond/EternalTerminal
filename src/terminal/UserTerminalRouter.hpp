@@ -32,7 +32,7 @@ class UserTerminalRouter {
 
   /**
    * @brief Returns the previously-registered `TerminalUserInfo` for a
-   * reconnecting client.
+   * reconnecting client, or nullopt when no registration exists.
    */
   std::optional<TerminalUserInfo> tryGetInfoForConnection(
       const shared_ptr<ServerClientConnection>& serverClientState);

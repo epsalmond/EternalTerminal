@@ -238,6 +238,8 @@ TEST_CASE("ServerConnection responds to known and unknown clients",
   serverThread.join();
   REQUIRE(server.newClientCalled);
   REQUIRE(server.clientConnectionExists("client-one"));
+  REQUIRE(server.tryGetClientConnection("client-one") == server.lastConnection);
+  REQUIRE_FALSE(server.tryGetClientConnection("missing"));
 
   handler->close(secondPair[0]);
   handler->close(secondPair[1]);

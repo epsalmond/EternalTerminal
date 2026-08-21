@@ -78,7 +78,7 @@ std::optional<TerminalUserInfo> UserTerminalRouter::tryGetInfoForConnection(
   lock_guard<recursive_mutex> guard(routerMutex);
   auto it = idInfoMap.find(serverClientState->getId());
   if (it == idInfoMap.end()) {
-    STFATAL << " Tried to read from an id that no longer exists";
+    return std::nullopt;
   }
 
   // While both the id and passkey are randomly generated, do an extra

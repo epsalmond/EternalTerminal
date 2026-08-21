@@ -151,6 +151,9 @@ TEST_CASE("UserTerminalRouter tracks ptyactive registrations",
 
   UserTerminalRouter router(socketHandler, routerEndpoint);
   REQUIRE_FALSE(router.isPtyActive("missing"));
+  auto missingConnection = make_shared<ServerClientConnection>(
+      socketHandler, "missing", -1, "0123456789abcdef0123456789abcdef");
+  REQUIRE_FALSE(router.tryGetInfoForConnection(missingConnection));
 
   IdKeyPair accepted;
   int fdA = registerFakeTerminal(socketHandler, router, routerEndpoint,
