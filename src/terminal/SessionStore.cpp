@@ -12,6 +12,7 @@
 #include "Headers.hpp"
 
 #ifndef WIN32
+#include <fcntl.h>
 #include <pwd.h>
 #include <unistd.h>
 #include <utime.h>
@@ -106,6 +107,7 @@ void saveSession(const SessionInfo& info) {
       std::to_string(info.port) + string("\nid=") + info.id +
       string("\npasskey=") + info.passkey + string("\nsavedat=") +
       std::to_string(info.savedAt) + string("\ntitle=") + info.title + "\n";
+#ifdef WIN32
   {
     std::ofstream out(tmpPath, std::ios::binary | std::ios::trunc);
     if (!out) {
@@ -117,6 +119,44 @@ void saveSession(const SessionInfo& info) {
       throw std::runtime_error("Could not write session file");
     }
   }
+#else
+  int tmpFd = ::open(tmpPath.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
+  if (tmpFd < 0) {
+    throw std::runtime_error("Could not create temp session file: " +
+                             string(strerror(errno)));
+  }
+  try {
+    if (::fchmod(tmpFd, 0600) != 0) {
+      throw std::runtime_error("Could not set session file permissions: " +
+                               string(strerror(errno)));
+    }
+    size_t written = 0;
+    while (written < contents.size()) {
+      const ssize_t rc =
+          ::write(tmpFd, contents.data() + written, contents.size() - written);
+      if (rc < 0 && errno == EINTR) {
+        continue;
+      }
+      if (rc <= 0) {
+        throw std::runtime_error("Could not write session file: " +
+                                 string(strerror(errno)));
+      }
+      written += static_cast<size_t>(rc);
+    }
+    if (::close(tmpFd) != 0) {
+      tmpFd = -1;
+      throw std::runtime_error("Could not close session file: " +
+                               string(strerror(errno)));
+    }
+    tmpFd = -1;
+  } catch (...) {
+    if (tmpFd >= 0) {
+      ::close(tmpFd);
+    }
+    fs::remove(tmpPath);
+    throw;
+  }
+#endif
   std::error_code ec;
   fs::rename(tmpPath, finalPath, ec);
   if (ec) {
@@ -124,75 +164,74 @@ void saveSession(const SessionInfo& info) {
     throw std::runtime_error("Could not move session file into place: " +
                              ec.message());
   }
-#ifndef WIN32
-  if (chmod(finalPath.c_str(), 0600) != 0) {
-    LOG(WARNING) << "Could not set session file permissions: "
-                 << strerror(errno);
-  }
-#endif
 }
 
 optional<SessionInfo> loadSession(const string& name) {
   if (!isValidSessionName(name)) {
     return std::nullopt;
   }
-  const fs::path path = sessionDirPath() + "/" + name;
-  if (!fs::is_regular_file(path)) {
-    return std::nullopt;
-  }
-
-  std::ifstream in(path);
-  if (!in) {
-    return std::nullopt;
-  }
-
-  SessionInfo info;
-  bool haveVersion = false;
-  bool havePort = false;
-  bool haveSavedAt = false;
-  string line;
-  while (std::getline(in, line)) {
-    if (line.empty()) {
-      continue;
-    }
-    const auto eq = line.find('=');
-    if (eq == string::npos || eq == 0) {
+  try {
+    const fs::path path = sessionDirPath() + "/" + name;
+    if (!fs::is_regular_file(path)) {
       return std::nullopt;
     }
-    const string key = line.substr(0, eq);
-    const string value = line.substr(eq + 1);
-    if (key == "version") {
-      haveVersion = (value == kSessionVersion);
-    } else if (key == "name") {
-      info.name = value;
-    } else if (key == "host") {
-      info.host = value;
-    } else if (key == "port") {
-      info.port = std::stoi(value);
-      havePort = true;
-    } else if (key == "id") {
-      info.id = value;
-    } else if (key == "passkey") {
-      info.passkey = value;
-    } else if (key == "savedat") {
-      info.savedAt = std::stoll(value);
-      haveSavedAt = true;
-    } else if (key == "title") {
-      info.title = value;
-    }
-  }
 
-  if (!haveVersion || !havePort || !haveSavedAt || info.name != name ||
-      info.host.empty() || info.id.empty() || info.passkey.empty() ||
-      info.port <= 0 || info.port > 65535) {
+    std::ifstream in(path);
+    if (!in) {
+      return std::nullopt;
+    }
+
+    SessionInfo info;
+    bool haveVersion = false;
+    bool havePort = false;
+    bool haveSavedAt = false;
+    string line;
+    while (std::getline(in, line)) {
+      if (line.empty()) {
+        continue;
+      }
+      const auto eq = line.find('=');
+      if (eq == string::npos || eq == 0) {
+        return std::nullopt;
+      }
+      const string key = line.substr(0, eq);
+      const string value = line.substr(eq + 1);
+      if (key == "version") {
+        haveVersion = (value == kSessionVersion);
+      } else if (key == "name") {
+        info.name = value;
+      } else if (key == "host") {
+        info.host = value;
+      } else if (key == "port") {
+        info.port = std::stoi(value);
+        havePort = true;
+      } else if (key == "id") {
+        info.id = value;
+      } else if (key == "passkey") {
+        info.passkey = value;
+      } else if (key == "savedat") {
+        info.savedAt = std::stoll(value);
+        haveSavedAt = true;
+      } else if (key == "title") {
+        info.title = value;
+      }
+    }
+
+    if (!haveVersion || !havePort || !haveSavedAt || info.name != name ||
+        info.host.empty() || info.id.empty() || info.passkey.empty() ||
+        info.port <= 0 || info.port > 65535) {
+      return std::nullopt;
+    }
+    struct stat fileStat;
+    if (::stat(path.c_str(), &fileStat) != 0) {
+      return std::nullopt;
+    }
+    info.lastSeenAt = static_cast<int64_t>(fileStat.st_mtime);
+    return info;
+  } catch (const std::exception& e) {
+    LOG(WARNING) << "Could not load session '" << name << "': " << e.what();
     return std::nullopt;
   }
-  struct stat fileStat;
-  if (::stat(path.c_str(), &fileStat) != 0) {
-    return std::nullopt;
-  }
-  info.lastSeenAt = static_cast<int64_t>(fileStat.st_mtime);
-  return info;
 }
 
 bool touchSession(const string& name) {
@@ -283,8 +322,11 @@ void deleteSession(const string& name) {
   }
   const fs::path path = sessionDirPath() + "/" + name;
   std::error_code ec;
-  if (fs::is_regular_file(path) && fs::remove(path, ec) && ec) {
-    LOG(WARNING) << "Could not delete session file: " << path.string();
+  if (fs::is_regular_file(path)) {
+    const bool removed = fs::remove(path, ec);
+    if (!removed || ec) {
+      LOG(WARNING) << "Could not delete session file: " << path.string();
+    }
   }
 }
 }  // namespace et

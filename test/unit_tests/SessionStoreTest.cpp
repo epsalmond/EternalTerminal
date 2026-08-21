@@ -232,6 +232,18 @@ TEST_CASE("SessionStore file permissions", "[SessionStore]") {
   env.requireModeLessPrivilegedThan(home + "/.et/sessions/secret", 0600);
 }
 
+TEST_CASE("SessionStore creates credential files with mode 0600",
+          "[SessionStore]") {
+  TestEnvironment env;
+  const string home = env.setHomeDir(env.createTempDir());
+  const mode_t previousUmask = ::umask(0022);
+
+  saveSession(makeInfo("secret"));
+
+  ::umask(previousUmask);
+  REQUIRE(env.fileMode(home + "/.et/sessions/secret") == 0600);
+}
+
 TEST_CASE("SessionStore load missing and invalid names", "[SessionStore]") {
   TestEnvironment env;
   env.setHomeDir(env.createTempDir());
@@ -276,6 +288,22 @@ TEST_CASE("SessionStore list is sorted and skips corrupt entries",
     FILE* f = fopen((dir + "/badversion").c_str(), "w");
     REQUIRE(f != nullptr);
     fprintf(f, "version=99\nname=badversion\n");
+    fclose(f);
+  }
+  {
+    FILE* f = fopen((dir + "/badport").c_str(), "w");
+    REQUIRE(f != nullptr);
+    fprintf(f,
+            "version=1\nname=badport\nhost=nas\nport=notanumber\n"
+            "id=id\npasskey=key\nsavedat=1755645600\n");
+    fclose(f);
+  }
+  {
+    FILE* f = fopen((dir + "/truncated").c_str(), "w");
+    REQUIRE(f != nullptr);
+    fprintf(f,
+            "version=1\nname=truncated\nhost=nas\nport=2022\n"
+            "id=id\npasskey=key\nsavedat=");
     fclose(f);
   }
 
