@@ -117,6 +117,15 @@ class FakeConsole : public Console {
     return s;
   }
 
+  bool hasTerminalData() {
+    int fd;
+    {
+      lock_guard<recursive_mutex> lock(_mutex);
+      fd = serverClientFd;
+    }
+    return fd >= 0 && socketHandler->hasData(fd);
+  }
+
   void simulateKeystrokes(const string& s) {
     int localClientServerFd;
     int localServerClientFd;
@@ -183,19 +192,26 @@ class FakeUserTerminal : public UserTerminal {
     pipePath = string(pipeDirectory) + "/pipe";
     SocketEndpoint endpoint;
     endpoint.set_name(pipePath);
-    serverClientFd = -1;
+    {
+      lock_guard<recursive_mutex> lock(_mutex);
+      serverClientFd = -1;
+    }
     std::thread serverListenThread(&FakeUserTerminal::listenFn, this,
                                    socketHandler, endpoint, &serverClientFd);
     // Wait for server to spin up
     ::usleep(1000 * 1000);
-    clientServerFd = socketHandler->connect(endpoint);
-    FATAL_FAIL(clientServerFd);
+    int fd = socketHandler->connect(endpoint);
+    FATAL_FAIL(fd);
+    {
+      lock_guard<recursive_mutex> lock(_mutex);
+      clientServerFd = fd;
+    }
     serverListenThread.join();
     FATAL_FAIL(serverClientFd);
     // Honor the UserTerminal contract: the handler polls this fd non-blocking.
-    int flags = fcntl(clientServerFd, F_GETFL, 0);
+    int flags = fcntl(fd, F_GETFL, 0);
     if (flags != -1) {
-      fcntl(clientServerFd, F_SETFL, flags | O_NONBLOCK);
+      fcntl(fd, F_SETFL, flags | O_NONBLOCK);
     }
     return getFd();
   };
@@ -204,26 +220,60 @@ class FakeUserTerminal : public UserTerminal {
 
   };
 
-  virtual int getFd() { return clientServerFd; }
+  virtual int getFd() {
+    lock_guard<recursive_mutex> lock(_mutex);
+    return clientServerFd;
+  }
 
   string getKeystrokes(int count) {
-    lock_guard<recursive_mutex> lock(_mutex);
     string s(count, '\0');
-    socketHandler->readAll(serverClientFd, &s[0], count, false);
+    int fd;
+    {
+      lock_guard<recursive_mutex> lock(_mutex);
+      fd = serverClientFd;
+    }
+    socketHandler->readAll(fd, &s[0], count, false);
     return s;
   }
 
-  void simulateTerminalResponse(const string& s) {
-    lock_guard<recursive_mutex> lock(_mutex);
-    socketHandler->writeAllOrThrow(serverClientFd, s.c_str(), s.length(),
-                                   false);
+  bool hasKeystrokes() {
+    int fd;
+    {
+      lock_guard<recursive_mutex> lock(_mutex);
+      fd = serverClientFd;
+    }
+    return fd >= 0 && socketHandler->hasData(fd);
   }
-  virtual void handleSessionEnd() { didHandleSessionEnd = true; }
-  virtual void cleanup() { didCleanUp = true; }
-  virtual void setInfo(const winsize& tmpwin) { lastWinInfo = tmpwin; }
 
-  bool wasCleanedUp() { return didCleanUp; }
-  bool sessionEndHandled() { return didHandleSessionEnd; }
+  void simulateTerminalResponse(const string& s) {
+    int fd;
+    {
+      lock_guard<recursive_mutex> lock(_mutex);
+      fd = serverClientFd;
+    }
+    socketHandler->writeAllOrThrow(fd, s.c_str(), s.length(), false);
+  }
+  virtual void handleSessionEnd() {
+    lock_guard<recursive_mutex> lock(_mutex);
+    didHandleSessionEnd = true;
+  }
+  virtual void cleanup() {
+    lock_guard<recursive_mutex> lock(_mutex);
+    didCleanUp = true;
+  }
+  virtual void setInfo(const winsize& tmpwin) {
+    lock_guard<recursive_mutex> lock(_mutex);
+    lastWinInfo = tmpwin;
+  }
+
+  bool wasCleanedUp() {
+    lock_guard<recursive_mutex> lock(_mutex);
+    return didCleanUp;
+  }
+  bool sessionEndHandled() {
+    lock_guard<recursive_mutex> lock(_mutex);
+    return didHandleSessionEnd;
+  }
 
   /** @brief True once setup() has both pipe ends connected. */
   bool isSetup() {
