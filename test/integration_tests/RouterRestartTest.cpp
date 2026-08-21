@@ -405,6 +405,54 @@ TEST_CASE("RouterRestartSurvival", "[RouterRestart]") {
   FATAL_FAIL(::remove(pipeDirectory.c_str()));
 }
 
+TEST_CASE("RouterReregistrationSurvivesWithLiveServer", "[RouterRestart]") {
+  const string pipeDirectory = makePipeDir();
+  RestartableServer target;
+  target.serverEndpoint.set_name(pipeDirectory + "/pipe_server");
+  target.routerEndpoint.set_name(pipeDirectory + "/pipe_router");
+  target.start();
+
+  SessionFixture session;
+  session.start(target);
+  const shared_ptr<ServerClientConnection> oldConnection =
+      target.server->getClientConnection(session.id);
+  const optional<TerminalUserInfo> oldInfo =
+      target.server->terminalRouter->tryGetInfoForConnection(oldConnection);
+  REQUIRE(oldInfo.has_value());
+  const int oldTerminalFd = oldInfo->fd();
+
+  // Break only this terminal-to-server pipe. The server process and its TCP
+  // listener remain live while etterminal re-registers the same session id.
+  REQUIRE(::shutdown(oldTerminalFd, SHUT_RDWR) == 0);
+
+  requireEventually(
+      [&]() {
+        const optional<TerminalUserInfo> info =
+            target.server->terminalRouter->tryGetInfoForConnection(
+                oldConnection);
+        return info && info->fd() != oldTerminalFd;
+      },
+      30, "replacement terminal registration");
+  requireEventually(
+      [&]() {
+        return target.server->getClientConnection(session.id) != oldConnection;
+      },
+      30, "client reconnect to replacement terminal pump");
+
+  session.console->simulateKeystrokes("N");
+  requireKeystrokesEventually(session.userTerminal, "N", 30,
+                              "input after terminal re-registration");
+  session.userTerminal->simulateTerminalResponse("R");
+  requireTerminalOutputEventually(session.console, "R", 30,
+                                  "output after terminal re-registration");
+
+  session.stop();
+  target.kill();
+  FATAL_FAIL(::remove((pipeDirectory + "/pipe_server").c_str()));
+  FATAL_FAIL(::remove((pipeDirectory + "/pipe_router").c_str()));
+  FATAL_FAIL(::remove(pipeDirectory.c_str()));
+}
+
 TEST_CASE("TerminalClientPersistsOscTitle", "[RouterRestart]") {
   ScopedTestHome home;
   const string pipeDirectory = makePipeDir();

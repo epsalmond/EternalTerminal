@@ -438,9 +438,15 @@ void TerminalServer::runTerminal(
       lock_guard<std::mutex> guard(terminalThreadMutex);
       serverHalted = halt;
     }
-    removeClient(id, !serverHalted);
     if (!serverHalted) {
-      terminalRouter->removeTerminal(id);
+      if (terminalRouter->removeTerminal(id, terminalFd)) {
+        removeClient(id, true);
+      } else {
+        // This pump belonged to a superseded terminal pipe. Preserve the
+        // fresh registration and key, but close the obsolete client
+        // connection so it reconnects and gets a new pump for the new fd.
+        destroyPartialConnection(id);
+      }
     }
   }
 }
