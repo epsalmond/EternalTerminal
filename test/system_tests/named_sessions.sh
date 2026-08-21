@@ -13,6 +13,9 @@ LOG_DIR=/tmp/et_test_logs/named_sessions
 SERVER_LOG_DIR=$LOG_DIR/server
 CLIENT_LOG=$LOG_DIR/client.log
 ATTACH_LOG=$LOG_DIR/attach.log
+NAME_LOG=$LOG_DIR/name.log
+MISMATCH_LOG=$LOG_DIR/mismatch.log
+RECREATE_LOG=$LOG_DIR/recreate.log
 INPUT_FIFO=$LOG_DIR/input_fifo
 ATTACH_FIFO=$LOG_DIR/attach_fifo
 
@@ -110,14 +113,63 @@ sleep 5
 printf 'echo POST-$ET_SENTINEL\n' >&10
 wait_for_grep 'POST-abc123' "$ATTACH_LOG" 30
 
-# A clean shell exit ends the session and drops the file.
-printf 'exit\n' >&10
+# Detach again, then --name with the same resolved endpoint reattaches instead
+# of rejecting the existing name.
+pkill -9 -P "$attach_pid" 2>/dev/null || true
+kill -9 "$attach_pid" 2>/dev/null || true
+pkill -9 -f "build/et --attach alpha" 2>/dev/null || true
+wait "$attach_pid" 2>/dev/null || true
+attach_pid=""
+
+HOME=$TEST_HOME script -qec "build/et --name alpha --serverfifo=$ET_FIFO \
+  --terminal-path $PWD/build/etterminal --logtostdout \
+  localhost:$ET_PORT" /dev/null <"$INPUT_FIFO" >"$NAME_LOG" 2>&1 &
+client_pid=$!
+printf 'echo NAME-$ET_SENTINEL\n' >&9
+wait_for_grep 'NAME-abc123' "$NAME_LOG" 30
+
+# The same name cannot silently switch to another saved endpoint.
+if HOME=$TEST_HOME build/et --name alpha "localhost:$((ET_PORT + 1))" \
+  >"$MISMATCH_LOG" 2>&1; then
+  echo "mismatched --name unexpectedly succeeded" >&2
+  exit 1
+fi
+grep -F -q "session alpha is saved for localhost:$ET_PORT; use --attach alpha or a different --name" \
+  "$MISMATCH_LOG"
+
+# Keep a copy of the credentials, end the remote shell, and restore that stale
+# record. --name must discard it and create a fresh shell.
+cp -p "$TEST_HOME/.et/sessions/alpha" "$LOG_DIR/alpha.stale"
+printf 'exit\n' >&9
 for _ in $(seq 1 100); do
   [ ! -f "$TEST_HOME/.et/sessions/alpha" ] && break
   sleep 0.1
 done
 [ ! -f "$TEST_HOME/.et/sessions/alpha" ] || {
   echo "session file not removed after clean exit" >&2
+  exit 1
+}
+wait "$client_pid" 2>/dev/null || true
+client_pid=""
+cp -p "$LOG_DIR/alpha.stale" "$TEST_HOME/.et/sessions/alpha"
+
+HOME=$TEST_HOME script -qec "build/et --name alpha --serverfifo=$ET_FIFO \
+  --terminal-path $PWD/build/etterminal --logtostdout \
+  localhost:$ET_PORT" /dev/null <"$ATTACH_FIFO" >"$RECREATE_LOG" 2>&1 &
+attach_pid=$!
+wait_for_grep "Session 'alpha' is no longer running; creating a fresh session" \
+  "$RECREATE_LOG" 30
+wait_for_file "$TEST_HOME/.et/sessions/alpha" 30
+printf 'if [ -z "${ET_SENTINEL+x}" ]; then echo FRESH-UNSET; else echo FRESH-SET; fi\n' >&10
+wait_for_grep 'FRESH-UNSET' "$RECREATE_LOG" 30
+
+printf 'exit\n' >&10
+for _ in $(seq 1 100); do
+  [ ! -f "$TEST_HOME/.et/sessions/alpha" ] && break
+  sleep 0.1
+done
+[ ! -f "$TEST_HOME/.et/sessions/alpha" ] || {
+  echo "fresh session file not removed after clean exit" >&2
   exit 1
 }
 wait "$attach_pid" 2>/dev/null || true

@@ -52,6 +52,53 @@ T extractSingleOptionWithDefault(const cxxopts::ParseResult& result,
   exit(0);
 }
 
+enum class AttachResult { ATTACHED, INVALID_SESSION, FAILED };
+
+AttachResult attachSavedSession(const string& name, const SessionInfo& session,
+                                const string& command, bool noexit,
+                                bool noTerminal, int keepaliveDuration) {
+  SocketEndpoint endpoint;
+  endpoint.set_name(session.host);
+  endpoint.set_port(session.port);
+  shared_ptr<SocketHandler> socket(new TcpSocketHandler());
+  shared_ptr<SocketHandler> pipeSocket(new PipeSocketHandler());
+
+  if (!ping(endpoint, socket)) {
+    CLOG(INFO, "stdout") << "Could not reach the ET server: " << endpoint.name()
+                         << ":" << endpoint.port() << endl;
+    return AttachResult::FAILED;
+  }
+
+  shared_ptr<Console> console;
+  if (!noTerminal) {
+    console.reset(new PseudoTerminalConsole());
+  }
+  bool sessionEnded = false;
+  try {
+    TerminalClient client(
+        socket, pipeSocket, endpoint, session.id, session.passkey, console,
+        /*jumphost=*/false, /*tunnels=*/"", /*reverseTunnels=*/"",
+        /*forwardSshAgent=*/false, /*identityAgent=*/"", keepaliveDuration,
+        /*envVars=*/{}, /*maxConnectAttempts=*/15,
+        /*exitOnConnectFailure=*/false,
+        [name]() { return touchSession(name); });
+    client.run(command, noexit);
+    sessionEnded = client.sessionEndedByServer();
+  } catch (const runtime_error& err) {
+    if (string(err.what()) == TerminalClient::INVALID_SESSION_CONNECT_ERROR) {
+      return AttachResult::INVALID_SESSION;
+    }
+    CLOG(INFO, "stdout") << "Could not attach to session '" << name
+                         << "': " << err.what() << endl;
+    return AttachResult::FAILED;
+  }
+
+  if (sessionEnded) {
+    deleteSession(name);
+  }
+  return AttachResult::ATTACHED;
+}
+
 // Resolved SSH config information for a host
 struct ResolvedSshConfig {
   string hostname;  // Resolved HostName (or original if not an alias)
@@ -280,57 +327,21 @@ int main(int argc, char** argv) {
         exit(1);
       }
 
-      SocketEndpoint attachEndpoint;
-      attachEndpoint.set_name(session->host);
-      attachEndpoint.set_port(session->port);
-      shared_ptr<SocketHandler> attachSocket(new TcpSocketHandler());
-      shared_ptr<SocketHandler> attachPipeSocket(new PipeSocketHandler());
-
-      if (!ping(attachEndpoint, attachSocket)) {
-        CLOG(INFO, "stdout")
-            << "Could not reach the ET server: " << attachEndpoint.name() << ":"
-            << attachEndpoint.port() << endl;
-        exit(1);
-      }
-
-      shared_ptr<Console> attachConsole;
-      if (!result.count("N")) {
-        attachConsole.reset(new PseudoTerminalConsole());
-      }
       int attachKeepalive = extractSingleOptionWithDefault<int>(
           result, options, "keepalive", MAX_CLIENT_KEEP_ALIVE_DURATION);
-      bool attachSessionEnded = false;
-      try {
-        TerminalClient attachClient(
-            attachSocket, attachPipeSocket, attachEndpoint, session->id,
-            session->passkey, attachConsole, /*jumphost=*/false,
-            /*tunnels=*/"", /*reverseTunnels=*/"",
-            /*forwardSshAgent=*/false, /*identityAgent=*/"", attachKeepalive,
-            /*envVars=*/{}, /*maxConnectAttempts=*/15,
-            /*exitOnConnectFailure=*/false,
-            [attachName]() { return touchSession(attachName); });
-        attachClient.run(
-            result.count("command") ? result["command"].as<string>() : "",
-            result.count("noexit"));
-        attachSessionEnded = attachClient.sessionEndedByServer();
-      } catch (const runtime_error& err) {
-        if (string(err.what()) ==
-            TerminalClient::INVALID_SESSION_CONNECT_ERROR) {
-          deleteSession(attachName);
-          CLOG(INFO, "stdout")
-              << "Session '" << attachName << "' is no longer running on "
-              << session->host << endl;
-        } else {
-          CLOG(INFO, "stdout") << "Could not attach to session '" << attachName
-                               << "': " << err.what() << endl;
-        }
+      const AttachResult attachResult = attachSavedSession(
+          attachName, *session,
+          result.count("command") ? result["command"].as<string>() : "",
+          result.count("noexit"), result.count("N"), attachKeepalive);
+      if (attachResult == AttachResult::INVALID_SESSION) {
+        deleteSession(attachName);
+        CLOG(INFO, "stdout")
+            << "Session '" << attachName << "' is no longer running on "
+            << session->host << endl;
         exit(1);
       }
-      // Only drop the saved file when the server says the session is gone
-      // (the remote shell ended).  A local exit — console closed, window
-      // died — leaves the remote shell running, so the file stays.
-      if (attachSessionEnded) {
-        deleteSession(attachName);
+      if (attachResult == AttachResult::FAILED) {
+        exit(1);
       }
       exit(0);
     }
@@ -421,18 +432,14 @@ int main(int argc, char** argv) {
 
     // Every session gets a name so it can be reattached after the client
     // (or machine) restarts: explicit --name, or a host+timestamp default.
+    optional<SessionInfo> namedSession;
     if (result.count("name")) {
       sessionName = result["name"].as<string>();
       if (!isValidSessionName(sessionName)) {
         CLOG(INFO, "stdout") << "Invalid session name: " << sessionName << endl;
         exit(1);
       }
-      if (loadSession(sessionName).has_value()) {
-        CLOG(INFO, "stdout")
-            << "session '" << sessionName << "' already exists; use --attach "
-            << sessionName << " or choose another --name" << endl;
-        exit(1);
-      }
+      namedSession = loadSession(sessionName);
     } else {
       char ts[32];
       time_t now = time(NULL);
@@ -510,6 +517,34 @@ int main(int argc, char** argv) {
       socketEndpoint.set_name(destinationHost);
       socketEndpoint.set_port(destinationPort);
     }
+
+    if (namedSession) {
+      if (namedSession->host != socketEndpoint.name() ||
+          namedSession->port != socketEndpoint.port()) {
+        CLOG(INFO, "stdout") << "session " << sessionName << " is saved for "
+                             << namedSession->host << ":" << namedSession->port
+                             << "; use --attach " << sessionName
+                             << " or a different --name" << endl;
+        exit(1);
+      }
+
+      const AttachResult attachResult = attachSavedSession(
+          sessionName, *namedSession,
+          result.count("command") ? result["command"].as<string>() : "",
+          result.count("noexit"), result.count("N"), keepaliveDuration);
+      if (attachResult == AttachResult::ATTACHED) {
+        exit(0);
+      }
+      if (attachResult == AttachResult::FAILED) {
+        exit(1);
+      }
+
+      deleteSession(sessionName);
+      CLOG(INFO, "stdout") << "Session '" << sessionName
+                           << "' is no longer running; creating a fresh session"
+                           << endl;
+    }
+
     shared_ptr<SocketHandler> clientSocket(new TcpSocketHandler());
     shared_ptr<SocketHandler> clientPipeSocket(new PipeSocketHandler());
 
