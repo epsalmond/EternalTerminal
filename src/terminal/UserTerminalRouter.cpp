@@ -54,7 +54,6 @@ IdKeyPair UserTerminalRouter::acceptNewConnection() {
         socketHandler->close(idInfoMap.at(tui.id()).fd());
         idInfoMap.erase(tui.id());
         idInfoMap.insert(std::make_pair(tui.id(), tui));
-        registrationChanged.notify_all();
       } else {
         LOG(ERROR) << "Rejecting duplicate terminal connection for "
                    << tui.id();
@@ -99,23 +98,16 @@ bool UserTerminalRouter::isPtyActive(const string& id) {
   return it != idInfoMap.end() && it->second.ptyactive();
 }
 
+bool UserTerminalRouter::isCurrentRegistration(const string& id,
+                                               int terminalFd) const {
+  lock_guard<recursive_mutex> guard(routerMutex);
+  const auto it = idInfoMap.find(id);
+  return it != idInfoMap.end() && it->second.fd() == terminalFd;
+}
+
 bool UserTerminalRouter::removeTerminal(const string& id, int terminalFd) {
-  unique_lock<recursive_mutex> guard(routerMutex);
+  lock_guard<recursive_mutex> guard(routerMutex);
   auto it = idInfoMap.find(id);
-  if (it == idInfoMap.end() || it->second.fd() != terminalFd) {
-    return false;
-  }
-  // A live etterminal reconnects immediately when only its Unix pipe dies.
-  // Give its replacement registration a short chance to win before treating
-  // the EOF as the shell ending. The original registration can still say
-  // ptyactive=false because it was sent just before TERMINAL_INIT created the
-  // pty, so every active pump needs this grace period. The condition variable
-  // releases routerMutex so acceptNewConnection can install the replacement.
-  registrationChanged.wait_for(guard, std::chrono::seconds(1), [&]() {
-    const auto current = idInfoMap.find(id);
-    return current == idInfoMap.end() || current->second.fd() != terminalFd;
-  });
-  it = idInfoMap.find(id);
   if (it == idInfoMap.end() || it->second.fd() != terminalFd) {
     return false;
   }

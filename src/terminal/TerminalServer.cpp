@@ -1,7 +1,9 @@
 #ifndef WIN32
 #include "TerminalServer.hpp"
 
+#include <chrono>
 #include <cstdint>
+#include <thread>
 
 #include "TelemetryService.hpp"
 
@@ -260,6 +262,7 @@ void TerminalServer::runTerminal(
   // Whether the TE should keep running.
   bool run = true;
   bool killRequested = false;
+  bool terminalEof = false;
 
   // TE sends/receives data to/from the shell one char at a time.
   char b[BUF_SIZE];
@@ -345,6 +348,7 @@ void TerminalServer::runTerminal(
               Packet(TerminalPacketType::TERMINAL_BUFFER, protoToString(tb)));
         } else if (rc == 0) {
           LOG(INFO) << "Terminal session ended";
+          terminalEof = true;
           if (killRequested) {
             serverClientState->writePacket(
                 Packet(TerminalPacketType::KEEP_ALIVE, SESSION_KILL_ACK));
@@ -446,24 +450,51 @@ void TerminalServer::runTerminal(
   }
   {
     string id = serverClientState->getId();
+    weak_ptr<ServerClientConnection> weakServerClientState = serverClientState;
     serverClientState.reset();
     // Drop the router entry only when the terminal side ended the session
     // (its pipe hit EOF or errored), so a future same-id registration is not
     // rejected (also fixes the MisterTea#428 leak).  On a server halt the
     // terminal is still alive: the entry must survive so a clean shutdown
     // can close the pipe and hand the terminal its EOF.
-    bool serverHalted;
-    {
+    const auto serverIsHalted = [this]() {
       lock_guard<std::mutex> guard(terminalThreadMutex);
-      serverHalted = halt;
-    }
+      return halt;
+    };
+    bool serverHalted = serverIsHalted();
     if (!serverHalted) {
-      if (terminalRouter->removeTerminal(id, terminalFd)) {
-        removeClient(id, true);
-      } else {
+      bool currentRegistration =
+          terminalRouter->isCurrentRegistration(id, terminalFd);
+      if (terminalEof) {
+        // A live etterminal reconnects immediately when only its pipe dies.
+        // Give the replacement time to win without holding router state.
+        const auto replacementDeadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        while (currentRegistration &&
+               std::chrono::steady_clock::now() < replacementDeadline) {
+          serverHalted = serverIsHalted();
+          const auto connection = weakServerClientState.lock();
+          if (serverHalted || !connection || connection->isShuttingDown()) {
+            break;
+          }
+          std::this_thread::sleep_for(std::chrono::milliseconds(50));
+          currentRegistration =
+              terminalRouter->isCurrentRegistration(id, terminalFd);
+        }
+      }
+      serverHalted = serverIsHalted();
+      if (serverHalted) {
+        return;
+      }
+      if (!currentRegistration) {
         // This pump belonged to a superseded terminal pipe. Preserve the
         // fresh registration and key, but close the obsolete client
         // connection so it reconnects and gets a new pump for the new fd.
+        destroyPartialConnection(id);
+      } else if (terminalRouter->removeTerminal(id, terminalFd)) {
+        removeClient(id, true);
+      } else {
+        // The registration changed after the last query.
         destroyPartialConnection(id);
       }
     }

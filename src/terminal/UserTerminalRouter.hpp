@@ -1,7 +1,6 @@
 #ifndef __ET_USER_TERMINAL_ROUTER__
 #define __ET_USER_TERMINAL_ROUTER__
 
-#include <condition_variable>
 #include <optional>
 
 #include "Headers.hpp"
@@ -49,6 +48,9 @@ class UserTerminalRouter {
    */
   bool isPtyActive(const string& id);
 
+  /** @brief Returns true when `terminalFd` still owns the registration. */
+  bool isCurrentRegistration(const string& id, int terminalFd) const;
+
   /**
    * @brief Closes and drops the registration only when `terminalFd` is still
    * the current fd for `id`. Returns false when a replacement registration
@@ -71,9 +73,7 @@ class UserTerminalRouter {
   /** @brief Pipe handler used for communicating with router clients. */
   shared_ptr<PipeSocketHandler> socketHandler;
   /** @brief Synchronizes access to the router state. */
-  recursive_mutex routerMutex;
-  /** @brief Wakes an ending pump when its terminal re-registers. */
-  condition_variable_any registrationChanged;
+  mutable recursive_mutex routerMutex;
 };
 }  // namespace et
 
