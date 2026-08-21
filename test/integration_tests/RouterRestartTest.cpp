@@ -124,12 +124,22 @@ struct SessionFixture {
   }
 
   void stop() {
-    client->shutdown();
-    clientThread.join();
-    client.reset();
-    handler->shutdown();
-    handlerThread.join();
-    handler.reset();
+    // Idempotent: the test body calls this explicitly and the dtor calls it
+    // again on unwind.
+    if (client) {
+      client->shutdown();
+      if (clientThread.joinable()) {
+        clientThread.join();
+      }
+      client.reset();
+    }
+    if (handler) {
+      handler->shutdown();
+      if (handlerThread.joinable()) {
+        handlerThread.join();
+      }
+      handler.reset();
+    }
   }
 
   string id;
