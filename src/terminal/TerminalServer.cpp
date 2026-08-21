@@ -269,6 +269,7 @@ void TerminalServer::runTerminal(
 
   if (!resume) {
     TermInit termInit;
+    termInit.set_hadreversetunnels(payload.reversetunnels_size() > 0);
     for (auto& it : environmentVariables) {
       *(termInit.add_environmentnames()) = it.first;
       *(termInit.add_environmentvalues()) = it.second;
@@ -276,6 +277,15 @@ void TerminalServer::runTerminal(
     terminalSocketHandler->writePacket(
         terminalFd,
         Packet(TerminalPacketType::TERMINAL_INIT, protoToString(termInit)));
+  }
+
+  if (resume && userInfo.hadreversetunnels()) {
+    TerminalBuffer notice;
+    notice.set_buffer(
+        "et: port forwards were not restored across the server restart; "
+        "reconnect to re-establish\r\n");
+    serverClientState->writePacket(
+        Packet(TerminalPacketType::TERMINAL_BUFFER, protoToString(notice)));
   }
 
   while (run) {

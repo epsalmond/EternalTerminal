@@ -75,6 +75,7 @@ message ConfigParams {
 message TermInit {
   repeated string environmentnames = 1;
   repeated string environmentvalues = 2;
+  optional bool hadreversetunnels = 3 [default = false];
 }
 
 message TerminalUserInfo {
@@ -87,4 +88,7 @@ message TerminalUserInfo {
   // its shell are already running, so the server must resume the session
   // instead of bootstrapping a fresh one.
   optional bool ptyactive = 6;
+  // Preserved by etterminal so a replacement server can warn that the
+  // server-side listeners from the original bootstrap no longer exist.
+  optional bool hadreversetunnels = 7 [default = false];
 }

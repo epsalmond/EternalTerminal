@@ -19,7 +19,8 @@ UserTerminalHandler::UserTerminalHandler(
       noratelimit(_noratelimit),
       routerEndpoint(routerEndpoint),
       shuttingDown(false),
-      ptyActive(false) {
+      ptyActive(false),
+      hadReverseTunnels(false) {
   auto idpasskey_splited = split(idPasskey, '/');
   id = idpasskey_splited[0];
   passkey = idpasskey_splited[1];
@@ -38,6 +39,7 @@ void UserTerminalHandler::registerWithRouter() {
   tui.set_uid(getuid());
   tui.set_gid(getgid());
   tui.set_ptyactive(ptyActive);
+  tui.set_hadreversetunnels(hadReverseTunnels);
 
   routerFd = ServerFifoPath::detectAndConnect(routerEndpoint, socketHandler);
 
@@ -97,6 +99,7 @@ void UserTerminalHandler::run() {
                 << termInitPacket.getHeader();
       }
       TermInit ti = stringToProto<TermInit>(termInitPacket.getPayload());
+      hadReverseTunnels = ti.hadreversetunnels();
       for (int a = 0; a < ti.environmentnames_size(); a++) {
         setenv(ti.environmentnames(a).c_str(), ti.environmentvalues(a).c_str(),
                true);
