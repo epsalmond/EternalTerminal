@@ -428,7 +428,6 @@ void TerminalServer::runTerminal(
   {
     string id = serverClientState->getId();
     serverClientState.reset();
-    removeClient(id);
     // Drop the router entry only when the terminal side ended the session
     // (its pipe hit EOF or errored), so a future same-id registration is not
     // rejected (also fixes the MisterTea#428 leak).  On a server halt the
@@ -439,6 +438,7 @@ void TerminalServer::runTerminal(
       lock_guard<std::mutex> guard(terminalThreadMutex);
       serverHalted = halt;
     }
+    removeClient(id, !serverHalted);
     if (!serverHalted) {
       terminalRouter->removeTerminal(id);
     }
