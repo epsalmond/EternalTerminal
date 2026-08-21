@@ -1,4 +1,5 @@
 #include <ftw.h>
+#include <utime.h>
 
 #include <optional>
 
@@ -97,6 +98,7 @@ SessionInfo makeInfo(const string& name, const string& host = "nas",
   info.id = id;
   info.passkey = passkey;
   info.savedAt = 1755645600;
+  info.lastSeenAt = 0;
   return info;
 }
 
@@ -136,6 +138,41 @@ TEST_CASE("SessionStore save/load round trip", "[SessionStore]") {
   REQUIRE(loaded->id == "id-abc");
   REQUIRE(loaded->passkey == string(32, 'p'));
   REQUIRE(loaded->savedAt == 1755645600);
+  REQUIRE(loaded->lastSeenAt > 0);
+}
+
+TEST_CASE("SessionStore touch updates last seen time", "[SessionStore]") {
+  TestEnvironment env;
+  const string home = env.setHomeDir(env.createTempDir());
+  const string path = home + "/.et/sessions/alpha";
+
+  saveSession(makeInfo("alpha"));
+  const time_t oldTime = time(nullptr) - 300;
+  struct utimbuf oldTimes = {oldTime, oldTime};
+  REQUIRE(::utime(path.c_str(), &oldTimes) == 0);
+
+  const optional<SessionInfo> oldSession = loadSession("alpha");
+  REQUIRE(oldSession.has_value());
+  REQUIRE(oldSession->lastSeenAt == oldTime);
+  REQUIRE(touchSession("alpha"));
+
+  const optional<SessionInfo> touchedSession = loadSession("alpha");
+  REQUIRE(touchedSession.has_value());
+  REQUIRE(touchedSession->lastSeenAt > oldSession->lastSeenAt);
+  REQUIRE(touchedSession->savedAt == oldSession->savedAt);
+  REQUIRE_FALSE(touchSession("missing"));
+  REQUIRE_FALSE(touchSession("../invalid"));
+}
+
+TEST_CASE("SessionStore formats relative last seen times", "[SessionStore]") {
+  const int64_t now = 1'000'000;
+  REQUIRE(formatLastSeen(now, now) == "now");
+  REQUIRE(formatLastSeen(now - 30, now) == "now");
+  REQUIRE(formatLastSeen(now - 45, now) == "45s ago");
+  REQUIRE(formatLastSeen(now - 5 * 60, now) == "5m ago");
+  REQUIRE(formatLastSeen(now - 3 * 60 * 60, now) == "3h ago");
+  REQUIRE(formatLastSeen(now - 2 * 24 * 60 * 60, now) == "2d ago");
+  REQUIRE(formatLastSeen(now + 10, now) == "now");
 }
 
 TEST_CASE("SessionStore file permissions", "[SessionStore]") {

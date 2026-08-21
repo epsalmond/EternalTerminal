@@ -218,18 +218,12 @@ int main(int argc, char** argv) {
     if (result.count("list")) {
       // Local-only operation: no connection is made.
       CLOG(INFO, "stdout") << left << setw(24) << "NAME" << setw(24) << "HOST"
-                           << setw(8) << "PORT" << "SAVED" << endl;
+                           << setw(8) << "PORT" << "LAST SEEN" << endl;
+      const int64_t now = static_cast<int64_t>(time(NULL));
       for (const auto& session : listSessions()) {
-        char saved[32];
-        struct tm savedTm;
-        // time_t is long on some platforms and long long on others; go
-        // through an explicit time_t so this compiles everywhere.
-        const time_t savedAt = static_cast<time_t>(session.savedAt);
-        localtime_r(&savedAt, &savedTm);
-        strftime(saved, sizeof(saved), "%Y-%m-%d %H:%M:%S", &savedTm);
-        CLOG(INFO, "stdout")
-            << left << setw(24) << session.name << setw(24) << session.host
-            << setw(8) << session.port << saved << endl;
+        CLOG(INFO, "stdout") << left << setw(24) << session.name << setw(24)
+                             << session.host << setw(8) << session.port
+                             << formatLastSeen(session.lastSeenAt, now) << endl;
       }
       exit(0);
     }
@@ -313,7 +307,8 @@ int main(int argc, char** argv) {
             /*tunnels=*/"", /*reverseTunnels=*/"",
             /*forwardSshAgent=*/false, /*identityAgent=*/"", attachKeepalive,
             /*envVars=*/{}, /*maxConnectAttempts=*/15,
-            /*exitOnConnectFailure=*/false);
+            /*exitOnConnectFailure=*/false,
+            [attachName]() { return touchSession(attachName); });
         attachClient.run(
             result.count("command") ? result["command"].as<string>() : "",
             result.count("noexit"));
@@ -591,7 +586,11 @@ int main(int argc, char** argv) {
     TerminalClient terminalClient(
         clientSocket, clientPipeSocket, socketEndpoint, idpasskeypair.first,
         idpasskeypair.second, console, is_jumphost, tunnel_arg, r_tunnel_arg,
-        forwardAgent, sshSocket, keepaliveDuration, sshConfigOptions.env_vars);
+        forwardAgent, sshSocket, keepaliveDuration, sshConfigOptions.env_vars,
+        /*maxConnectAttempts=*/3, /*exitOnConnectFailure=*/true,
+        [&sessionName]() {
+          return sessionName.empty() || touchSession(sessionName);
+        });
 
     // The connection is up: persist the session so a rebooted or killed
     // client can reattach with --attach.

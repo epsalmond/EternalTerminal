@@ -18,10 +18,11 @@ TerminalClient::TerminalClient(
     const string& tunnels, const string& reverseTunnels, bool forwardSshAgent,
     const string& identityAgent, int _keepaliveDuration,
     const vector<pair<string, string>>& envVars, int _maxConnectAttempts,
-    bool _exitOnConnectFailure)
+    bool _exitOnConnectFailure, std::function<bool()> _sessionHeartbeat)
     : console(_console),
       shuttingDown(false),
-      keepaliveDuration(_keepaliveDuration) {
+      keepaliveDuration(_keepaliveDuration),
+      sessionHeartbeat(_sessionHeartbeat) {
   portForwardHandler = shared_ptr<PortForwardHandler>(
       new PortForwardHandler(_socketHandler, _pipeSocketHandler));
   InitialPayload payload;
@@ -189,6 +190,8 @@ void TerminalClient::run(const string& command, const bool noexit) {
 
   time_t keepaliveTime = time(NULL) + keepaliveDuration;
   bool waitingOnKeepalive = false;
+  time_t sessionHeartbeatTime = time(NULL);
+  bool sessionHeartbeatWarningLogged = false;
 
   if (command.length()) {
     LOG(INFO) << "Got command: " << command;
@@ -424,6 +427,22 @@ void TerminalClient::run(const string& command, const bool noexit) {
             Packet(TerminalPacketType::PORT_FORWARD_DATA, protoToString(pwd)));
         VLOG(4) << "send PF data";
         keepaliveTime = time(NULL) + keepaliveDuration;
+      }
+
+      const time_t now = time(NULL);
+      if (sessionHeartbeat && connection->getSocketFd() > 0 &&
+          sessionHeartbeatTime <= now) {
+        bool heartbeatSucceeded = false;
+        try {
+          heartbeatSucceeded = sessionHeartbeat();
+        } catch (...) {
+          // Session persistence is best-effort and must not end a connection.
+        }
+        if (!heartbeatSucceeded && !sessionHeartbeatWarningLogged) {
+          LOG(WARNING) << "Could not update saved session heartbeat";
+          sessionHeartbeatWarningLogged = true;
+        }
+        sessionHeartbeatTime = now + 15;
       }
     } catch (const runtime_error& re) {
       STERROR << "Error: " << re.what();

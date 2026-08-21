@@ -81,6 +81,9 @@ printf 'ET_SENTINEL=abc123\n' >&9
 printf 'echo PRE-$((6*7))\n' >&9
 wait_for_grep 'PRE-42' "$CLIENT_LOG" 30
 
+# A connected client keeps the session fresh for the offline list.
+HOME=$TEST_HOME build/et --list | grep -E -q 'alpha.*now'
+
 # Simulate a laptop reboot: SIGKILL the client (the script wrapper and the
 # et process under it).  The session file must stay.
 pkill -9 -P "$client_pid" 2>/dev/null || true
@@ -93,8 +96,10 @@ client_pid=""
   exit 1
 }
 
-# --list shows the session without connecting.
-HOME=$TEST_HOME build/et --list | grep -q alpha
+# --list shows coarse file age without connecting. Backdate the file instead
+# of waiting for the 30-second "now" window to expire.
+touch -d '5 minutes ago' "$TEST_HOME/.et/sessions/alpha"
+HOME=$TEST_HOME build/et --list | grep -E -q 'alpha.*5m ago'
 
 # --attach reattaches to the same remote shell: the sentinel is still set.
 HOME=$TEST_HOME script -qec "build/et --attach alpha --serverfifo=$ET_FIFO \

@@ -1,6 +1,8 @@
 #ifndef __ET_TERMINAL_CLIENT__
 #define __ET_TERMINAL_CLIENT__
 
+#include <functional>
+
 #include "ClientConnection.hpp"
 #include "Console.hpp"
 #include "CryptoHandler.hpp"
@@ -42,8 +44,8 @@ class TerminalClient {
                  const string& reverseTunnels, bool forwardSshAgent,
                  const string& identityAgent, int _keepaliveDuration,
                  const vector<pair<string, string>>& envVars,
-                 int _maxConnectAttempts = 3,
-                 bool _exitOnConnectFailure = true);
+                 int _maxConnectAttempts = 3, bool _exitOnConnectFailure = true,
+                 std::function<bool()> _sessionHeartbeat = {});
   /** @brief Tears down the client, closing sockets and stopping background
    * threads. */
   virtual ~TerminalClient();
@@ -80,6 +82,8 @@ class TerminalClient {
   recursive_mutex shutdownMutex;
   /** @brief Keepalive interval (seconds) sent to the server. */
   int keepaliveDuration;
+  /** @brief Best-effort callback that updates named-session liveness. */
+  std::function<bool()> sessionHeartbeat;
 };
 
 }  // namespace et

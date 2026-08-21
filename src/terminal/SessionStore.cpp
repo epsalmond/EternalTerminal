@@ -14,6 +14,7 @@
 #ifndef WIN32
 #include <pwd.h>
 #include <unistd.h>
+#include <utime.h>
 #endif
 
 namespace et {
@@ -184,7 +185,46 @@ optional<SessionInfo> loadSession(const string& name) {
       info.port <= 0 || info.port > 65535) {
     return std::nullopt;
   }
+  struct stat fileStat;
+  if (::stat(path.c_str(), &fileStat) != 0) {
+    return std::nullopt;
+  }
+  info.lastSeenAt = static_cast<int64_t>(fileStat.st_mtime);
   return info;
+}
+
+bool touchSession(const string& name) {
+  if (!isValidSessionName(name)) {
+    return false;
+  }
+  const fs::path path = sessionDirPath() + "/" + name;
+  std::error_code ec;
+  if (!fs::is_regular_file(path, ec) || ec) {
+    return false;
+  }
+#ifdef WIN32
+  fs::last_write_time(path, fs::file_time_type::clock::now(), ec);
+  return !ec;
+#else
+  return ::utime(path.c_str(), nullptr) == 0;
+#endif
+}
+
+string formatLastSeen(int64_t lastSeenAt, int64_t now) {
+  const int64_t age = std::max<int64_t>(0, now - lastSeenAt);
+  if (age <= 30) {
+    return "now";
+  }
+  if (age < 60) {
+    return std::to_string(age) + "s ago";
+  }
+  if (age < 60 * 60) {
+    return std::to_string(age / 60) + "m ago";
+  }
+  if (age < 24 * 60 * 60) {
+    return std::to_string(age / (60 * 60)) + "h ago";
+  }
+  return std::to_string(age / (24 * 60 * 60)) + "d ago";
 }
 
 vector<SessionInfo> listSessions() {
