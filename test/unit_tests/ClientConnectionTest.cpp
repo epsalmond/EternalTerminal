@@ -37,17 +37,20 @@ class SocketPairHandler : public SocketHandler {
   int accept(int fd) override { return fd; }
   void stopListening(const SocketEndpoint&) override {}
   void close(int fd) override {
+    lock_guard<std::mutex> guard(closeCountsMutex);
     closeCounts[fd]++;
     ::close(fd);
   }
   vector<int> getActiveSockets() override { return {}; }
   int closeCount(int fd) const {
+    lock_guard<std::mutex> guard(closeCountsMutex);
     auto it = closeCounts.find(fd);
     return it == closeCounts.end() ? 0 : it->second;
   }
 
  private:
   std::queue<int> connectQueue;
+  mutable std::mutex closeCountsMutex;
   std::map<int, int> closeCounts;
 };
 
