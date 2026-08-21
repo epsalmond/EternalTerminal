@@ -26,6 +26,52 @@ size_t utf8SequenceLength(unsigned char byte) {
   }
   return 0;
 }
+
+bool decodeUtf8(const std::string& bytes, size_t offset, size_t* length,
+                uint32_t* codePoint) {
+  const unsigned char first = static_cast<unsigned char>(bytes[offset]);
+  if (first <= 0x7f) {
+    *length = 1;
+    *codePoint = first;
+    return true;
+  }
+
+  size_t expectedLength;
+  uint32_t value;
+  if (first >= 0xc2 && first <= 0xdf) {
+    expectedLength = 2;
+    value = first & 0x1f;
+  } else if (first >= 0xe0 && first <= 0xef) {
+    expectedLength = 3;
+    value = first & 0x0f;
+  } else if (first >= 0xf0 && first <= 0xf4) {
+    expectedLength = 4;
+    value = first & 0x07;
+  } else {
+    return false;
+  }
+  if (offset + expectedLength > bytes.size()) {
+    return false;
+  }
+
+  const unsigned char second = static_cast<unsigned char>(bytes[offset + 1]);
+  if (!isUtf8Continuation(second) || (first == 0xe0 && second < 0xa0) ||
+      (first == 0xed && second >= 0xa0) || (first == 0xf0 && second < 0x90) ||
+      (first == 0xf4 && second >= 0x90)) {
+    return false;
+  }
+  for (size_t i = 1; i < expectedLength; ++i) {
+    const unsigned char continuation =
+        static_cast<unsigned char>(bytes[offset + i]);
+    if (!isUtf8Continuation(continuation)) {
+      return false;
+    }
+    value = (value << 6) | (continuation & 0x3f);
+  }
+  *length = expectedLength;
+  *codePoint = value;
+  return true;
+}
 }  // namespace
 
 void TitleParser::beginOsc() {
@@ -38,10 +84,18 @@ void TitleParser::beginOsc() {
 std::string TitleParser::sanitizeTitle() const {
   std::string sanitized;
   sanitized.reserve(std::min(title.size(), kMaxTitleBytes));
-  for (unsigned char byte : title) {
-    if (byte >= 0x20 && byte != 0x7f) {
-      sanitized.push_back(static_cast<char>(byte));
+  for (size_t offset = 0; offset < title.size();) {
+    size_t length;
+    uint32_t codePoint;
+    if (!decodeUtf8(title, offset, &length, &codePoint)) {
+      ++offset;
+      continue;
     }
+    if (codePoint >= 0x20 && codePoint != 0x7f &&
+        !(codePoint >= 0x80 && codePoint <= 0x9f)) {
+      sanitized.append(title, offset, length);
+    }
+    offset += length;
   }
   if (sanitized.size() <= kMaxTitleBytes) {
     return sanitized;
