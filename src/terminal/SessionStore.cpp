@@ -60,6 +60,136 @@ bool isPrintableNoBreaks(const string& value) {
   return !value.empty() && value.find_first_of("\r\n") == string::npos;
 }
 
+#ifndef WIN32
+constexpr mode_t kSessionDirectoryMode = 0700;
+
+bool isOwnedDirectory(const struct stat& fileStat) {
+  return S_ISDIR(fileStat.st_mode) && fileStat.st_uid == getuid() &&
+         (fileStat.st_mode & (S_IRWXG | S_IRWXO)) == 0;
+}
+
+bool isOwnedSessionFile(const struct stat& fileStat) {
+  return S_ISREG(fileStat.st_mode) && fileStat.st_uid == getuid() &&
+         (fileStat.st_mode & (S_IRWXG | S_IRWXO)) == 0 &&
+         fileStat.st_nlink == 1;
+}
+
+bool lstatPath(const fs::path& path, struct stat* fileStat) {
+  return ::lstat(path.c_str(), fileStat) == 0;
+}
+
+void verifySessionDirectory(const fs::path& path, bool allowMissing) {
+  struct stat fileStat;
+  if (!lstatPath(path, &fileStat)) {
+    if (allowMissing && errno == ENOENT) {
+      return;
+    }
+    throw std::runtime_error("Could not inspect session directory: " +
+                             string(strerror(errno)));
+  }
+  if (!isOwnedDirectory(fileStat)) {
+    throw std::runtime_error(
+        "Session directory has unsafe owner or permissions");
+  }
+}
+
+void verifySessionDirectories(const fs::path& sessionsPath, bool allowMissing) {
+  verifySessionDirectory(sessionsPath.parent_path(), allowMissing);
+  verifySessionDirectory(sessionsPath, allowMissing);
+}
+
+void ensureDir(const fs::path& path) {
+  struct stat fileStat;
+  if (!lstatPath(path, &fileStat)) {
+    const int inspectErrno = errno;
+    if (inspectErrno != ENOENT) {
+      throw std::runtime_error("Could not create session directory: " +
+                               string(strerror(inspectErrno)));
+    }
+    if (::mkdir(path.c_str(), kSessionDirectoryMode) != 0 && errno != EEXIST) {
+      throw std::runtime_error("Could not create session directory: " +
+                               string(strerror(errno)));
+    }
+    if (!lstatPath(path, &fileStat)) {
+      throw std::runtime_error("Could not inspect session directory: " +
+                               string(strerror(errno)));
+    }
+  }
+  if (!S_ISDIR(fileStat.st_mode) || fileStat.st_uid != getuid()) {
+    throw std::runtime_error(
+        "Session directory has unsafe owner or is not a directory");
+  }
+  if ((fileStat.st_mode & (S_IRWXG | S_IRWXO)) != 0 &&
+      ::chmod(path.c_str(), kSessionDirectoryMode) != 0) {
+    throw std::runtime_error("Could not set session directory permissions: " +
+                             string(strerror(errno)));
+  }
+  verifySessionDirectory(path, false);
+}
+
+int openSessionFile(const fs::path& path) {
+  int flags = O_RDONLY | O_NONBLOCK;
+#ifdef O_CLOEXEC
+  flags |= O_CLOEXEC;
+#endif
+#ifdef O_NOFOLLOW
+  flags |= O_NOFOLLOW;
+#endif
+  return ::open(path.c_str(), flags);
+}
+
+optional<string> readSessionContents(const fs::path& path, const string& name,
+                                     int64_t* lastSeenAt) {
+  struct stat pathStat;
+  if (!lstatPath(path, &pathStat)) {
+    return std::nullopt;
+  }
+  if (!S_ISREG(pathStat.st_mode)) {
+    LOG(WARNING) << "Skipping unsafe session file '" << name << "'";
+    return std::nullopt;
+  }
+  const int fd = openSessionFile(path);
+  if (fd < 0) {
+    return std::nullopt;
+  }
+
+  struct stat fileStat;
+  const bool safeFile =
+      ::fstat(fd, &fileStat) == 0 && isOwnedSessionFile(fileStat);
+  if (!safeFile) {
+    ::close(fd);
+    LOG(WARNING) << "Skipping unsafe session file '" << name << "'";
+    return std::nullopt;
+  }
+  *lastSeenAt = static_cast<int64_t>(fileStat.st_mtime);
+
+  constexpr size_t kMaxSessionFileBytes = 64 * 1024;
+  string contents;
+  char buffer[4096];
+  while (true) {
+    const ssize_t bytesRead = ::read(fd, buffer, sizeof(buffer));
+    if (bytesRead < 0 && errno == EINTR) {
+      continue;
+    }
+    if (bytesRead < 0) {
+      ::close(fd);
+      return std::nullopt;
+    }
+    if (bytesRead == 0) {
+      break;
+    }
+    if (contents.size() + static_cast<size_t>(bytesRead) >
+        kMaxSessionFileBytes) {
+      ::close(fd);
+      LOG(WARNING) << "Skipping oversized session file '" << name << "'";
+      return std::nullopt;
+    }
+    contents.append(buffer, static_cast<size_t>(bytesRead));
+  }
+  ::close(fd);
+  return contents;
+}
+#else
 void ensureDir(const fs::path& path) {
   std::error_code ec;
   fs::create_directories(path, ec);
@@ -67,13 +197,8 @@ void ensureDir(const fs::path& path) {
     throw std::runtime_error("Could not create directory " + path.string() +
                              ": " + ec.message());
   }
-#ifndef WIN32
-  if (chmod(path.c_str(), 0700) != 0) {
-    throw std::runtime_error("Could not set permissions on " + path.string() +
-                             ": " + strerror(errno));
-  }
-#endif
 }
+#endif
 }  // namespace
 
 bool isValidSessionName(const string& name) {
@@ -82,7 +207,7 @@ bool isValidSessionName(const string& name) {
 
 string sessionDirPath() { return homeDir() + "/.et/sessions"; }
 
-void saveSession(const SessionInfo& info) {
+void saveSession(const SessionInfo& info, bool replaceExisting) {
   if (!isValidSessionName(info.name)) {
     throw std::runtime_error("Invalid session name: " + info.name);
   }
@@ -100,6 +225,18 @@ void saveSession(const SessionInfo& info) {
   // crashed writer can never leave a half-written session file behind.
   const fs::path tmpPath = dir / ("." + info.name + "." + genRandomAlphaNum(8));
   const fs::path finalPath = dir / info.name;
+
+  // Do not replace an existing hard-linked credential file.  Replacing the
+  // directory entry would leave the old passkey readable through the other
+  // link, outside the ownership boundary of this store.
+#ifndef WIN32
+  struct stat finalStat;
+  if (lstatPath(finalPath, &finalStat) && S_ISREG(finalStat.st_mode) &&
+      finalStat.st_nlink != 1) {
+    throw std::runtime_error(
+        "Could not replace session file with unsafe hard links");
+  }
+#endif
 
   string contents =
       string("version=") + kSessionVersion + string("\nname=") + info.name +
@@ -143,6 +280,10 @@ void saveSession(const SessionInfo& info) {
       }
       written += static_cast<size_t>(rc);
     }
+    if (::fsync(tmpFd) != 0) {
+      throw std::runtime_error("Could not sync session file: " +
+                               string(strerror(errno)));
+    }
     if (::close(tmpFd) != 0) {
       tmpFd = -1;
       throw std::runtime_error("Could not close session file: " +
@@ -157,6 +298,56 @@ void saveSession(const SessionInfo& info) {
     throw;
   }
 #endif
+#ifndef WIN32
+  auto syncSessionDirectory = [&dir]() {
+    int flags = O_RDONLY;
+#ifdef O_DIRECTORY
+    flags |= O_DIRECTORY;
+#endif
+    const int dirFd = ::open(dir.c_str(), flags);
+    if (dirFd < 0) {
+      throw std::runtime_error("Could not open session directory: " +
+                               string(strerror(errno)));
+    }
+    const int syncResult = ::fsync(dirFd);
+    const int syncErrno = errno;
+    ::close(dirFd);
+    if (syncResult != 0) {
+      throw std::runtime_error("Could not sync session directory: " +
+                               string(strerror(syncErrno)));
+    }
+  };
+  if (!replaceExisting) {
+    // link(2) creates the final directory entry without replacing an entry
+    // that appeared after the candidate name was selected. Remove the temp
+    // name afterwards so the credential file has one hard link again.
+    if (::link(tmpPath.c_str(), finalPath.c_str()) != 0) {
+      const string error = strerror(errno);
+      fs::remove(tmpPath);
+      throw std::runtime_error("Could not create session file: " + error);
+    }
+    if (::unlink(tmpPath.c_str()) != 0) {
+      const string error = strerror(errno);
+      fs::remove(tmpPath);
+      throw std::runtime_error("Could not finalize session file: " + error);
+    }
+    syncSessionDirectory();
+  } else {
+    std::error_code ec;
+    fs::rename(tmpPath, finalPath, ec);
+    if (ec) {
+      fs::remove(tmpPath);
+      throw std::runtime_error("Could not move session file into place: " +
+                               ec.message());
+    }
+    syncSessionDirectory();
+  }
+#else
+  if (!replaceExisting) {
+    fs::remove(tmpPath);
+    throw std::runtime_error(
+        "Non-replacing session storage is unavailable on Windows");
+  }
   std::error_code ec;
   fs::rename(tmpPath, finalPath, ec);
   if (ec) {
@@ -164,6 +355,7 @@ void saveSession(const SessionInfo& info) {
     throw std::runtime_error("Could not move session file into place: " +
                              ec.message());
   }
+#endif
 }
 
 optional<SessionInfo> loadSession(const string& name) {
@@ -172,6 +364,16 @@ optional<SessionInfo> loadSession(const string& name) {
   }
   try {
     const fs::path path = sessionDirPath() + "/" + name;
+#ifndef WIN32
+    verifySessionDirectories(path.parent_path(), true);
+    int64_t lastSeenAt = 0;
+    const optional<string> contents =
+        readSessionContents(path, name, &lastSeenAt);
+    if (!contents) {
+      return std::nullopt;
+    }
+    std::istringstream in(*contents);
+#else
     if (!fs::is_regular_file(path)) {
       return std::nullopt;
     }
@@ -180,6 +382,7 @@ optional<SessionInfo> loadSession(const string& name) {
     if (!in) {
       return std::nullopt;
     }
+#endif
 
     SessionInfo info;
     bool haveVersion = false;
@@ -222,11 +425,15 @@ optional<SessionInfo> loadSession(const string& name) {
         info.port <= 0 || info.port > 65535) {
       return std::nullopt;
     }
+#ifndef WIN32
+    info.lastSeenAt = lastSeenAt;
+#else
     struct stat fileStat;
     if (::stat(path.c_str(), &fileStat) != 0) {
       return std::nullopt;
     }
     info.lastSeenAt = static_cast<int64_t>(fileStat.st_mtime);
+#endif
     return info;
   } catch (const std::exception& e) {
     LOG(WARNING) << "Could not load session '" << name << "': " << e.what();
@@ -239,6 +446,25 @@ bool touchSession(const string& name) {
     return false;
   }
   const fs::path path = sessionDirPath() + "/" + name;
+#ifndef WIN32
+  try {
+    verifySessionDirectories(path.parent_path(), true);
+  } catch (...) {
+    return false;
+  }
+  const int fd = openSessionFile(path);
+  if (fd < 0) {
+    return false;
+  }
+  struct stat fileStat;
+  if (::fstat(fd, &fileStat) != 0 || !isOwnedSessionFile(fileStat)) {
+    ::close(fd);
+    return false;
+  }
+  const bool touched = ::futimens(fd, nullptr) == 0;
+  ::close(fd);
+  return touched;
+#else
   std::error_code ec;
   if (!fs::is_regular_file(path, ec) || ec) {
     return false;
@@ -248,6 +474,7 @@ bool touchSession(const string& name) {
   return !ec;
 #else
   return ::utime(path.c_str(), nullptr) == 0;
+#endif
 #endif
 }
 
@@ -291,6 +518,14 @@ vector<SessionInfo> listSessions() {
     LOG(WARNING) << "Could not list sessions: " << e.what();
     return sessions;
   }
+#ifndef WIN32
+  try {
+    verifySessionDirectories(dir, true);
+  } catch (const std::exception& e) {
+    LOG(WARNING) << "Could not list sessions: " << e.what();
+    return sessions;
+  }
+#endif
   std::error_code ec;
   const bool isDirectory = fs::is_directory(dir, ec);
   if (ec) {
@@ -326,6 +561,21 @@ void deleteSession(const string& name) {
     return;
   }
   const fs::path path = sessionDirPath() + "/" + name;
+#ifndef WIN32
+  try {
+    verifySessionDirectories(path.parent_path(), true);
+  } catch (...) {
+    return;
+  }
+  struct stat fileStat;
+  if (!lstatPath(path, &fileStat) || !isOwnedSessionFile(fileStat)) {
+    return;
+  }
+  if (::unlink(path.c_str()) != 0 && errno != ENOENT) {
+    LOG(WARNING) << "Could not delete session file '" << name
+                 << "': " << strerror(errno);
+  }
+#else
   std::error_code ec;
   if (fs::is_regular_file(path)) {
     const bool removed = fs::remove(path, ec);
@@ -333,5 +583,6 @@ void deleteSession(const string& name) {
       LOG(WARNING) << "Could not delete session file: " << path.string();
     }
   }
+#endif
 }
 }  // namespace et
