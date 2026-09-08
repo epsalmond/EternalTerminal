@@ -315,7 +315,9 @@ attach_pid=$!
 wait_for_grep "Session 'alpha' is no longer running; creating a fresh session" \
   "$RECREATE_LOG" 30
 wait_for_file "$TEST_HOME/.et/sessions/alpha" 30
-printf 'if [ -z "${ET_SENTINEL+x}" ]; then echo FRESH-UNSET; else echo FRESH-SET; fi\n' >&10
+# Keep the expected marker out of the command itself: script(1) echoes input
+# before ET has necessarily completed initialization of the replacement shell.
+printf 'if [ -z "${ET_SENTINEL+x}" ]; then result=UNSET; else result=SET; fi; echo FRESH-$result\n' >&10
 wait_for_grep 'FRESH-UNSET' "$RECREATE_LOG" 30
 
 # Preserve the live credentials for stale and unreachable follow-up cases,

@@ -306,6 +306,38 @@ class DefaultPersistenceCliTest(unittest.TestCase):
         self._assert_credentials_hidden(attached.stdout, [record])
         self._wait(lambda: not self._records(), "ended session record removal")
 
+    def test_kill_initialized_session_while_client_is_attached(self):
+        ready = self.workspace / "attached-ready"
+        client = self._start_client("-e", "-c", "touch " + str(ready))
+        self._wait(
+            lambda: len(self._records()) == 1 and ready.is_file(),
+            "attached shell initialization",
+        )
+        record = self._records()[0]
+        killed = subprocess.run(
+            [
+                str(self.et),
+                "--telemetry=false",
+                "--kill",
+                record["name"],
+                "--logdir",
+                str(self.logs),
+                "--logtostdout",
+            ],
+            env=self.env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            errors="replace",
+            timeout=self.timeout,
+        )
+        self._assert_credentials_hidden(killed.stdout, [record])
+        self.assertEqual(killed.returncode, 0)
+        self.assertFalse(self._records())
+        self._wait(lambda: client.poll() is not None, "attached client exit")
+        self._assert_credentials_hidden(self._finish_client(client), [record])
+
     def _cleanup(self):
         for client in getattr(self, "clients", []):
             self._finish_client(client, True)
