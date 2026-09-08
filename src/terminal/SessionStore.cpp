@@ -15,7 +15,6 @@
 #include <fcntl.h>
 #include <pwd.h>
 #include <unistd.h>
-#include <utime.h>
 #endif
 
 namespace et {
@@ -469,12 +468,8 @@ bool touchSession(const string& name) {
   if (!fs::is_regular_file(path, ec) || ec) {
     return false;
   }
-#ifdef WIN32
   fs::last_write_time(path, fs::file_time_type::clock::now(), ec);
   return !ec;
-#else
-  return ::utime(path.c_str(), nullptr) == 0;
-#endif
 #endif
 }
 
@@ -562,26 +557,37 @@ void deleteSession(const string& name) {
   }
   const fs::path path = sessionDirPath() + "/" + name;
 #ifndef WIN32
-  try {
-    verifySessionDirectories(path.parent_path(), true);
-  } catch (...) {
-    return;
-  }
+  verifySessionDirectories(path.parent_path(), true);
   struct stat fileStat;
-  if (!lstatPath(path, &fileStat) || !isOwnedSessionFile(fileStat)) {
-    return;
+  if (!lstatPath(path, &fileStat)) {
+    if (errno == ENOENT) {
+      return;
+    }
+    throw std::runtime_error("Could not inspect session file for deletion: " +
+                             string(strerror(errno)));
+  }
+  if (!isOwnedSessionFile(fileStat)) {
+    throw std::runtime_error(
+        "Refusing to delete a session file with unsafe owner, type, links or "
+        "permissions");
   }
   if (::unlink(path.c_str()) != 0 && errno != ENOENT) {
-    LOG(WARNING) << "Could not delete session file '" << name
-                 << "': " << strerror(errno);
+    throw std::runtime_error("Could not delete session file: " +
+                             string(strerror(errno)));
   }
 #else
   std::error_code ec;
-  if (fs::is_regular_file(path)) {
-    const bool removed = fs::remove(path, ec);
-    if (!removed || ec) {
-      LOG(WARNING) << "Could not delete session file: " << path.string();
-    }
+  const auto status = fs::symlink_status(path, ec);
+  if (ec == std::errc::no_such_file_or_directory ||
+      (!ec && !fs::exists(status))) {
+    return;
+  }
+  if (ec || !fs::is_regular_file(status)) {
+    throw std::runtime_error("Could not inspect session file for deletion");
+  }
+  fs::remove(path, ec);
+  if (ec) {
+    throw std::runtime_error("Could not delete session file: " + ec.message());
   }
 #endif
 }

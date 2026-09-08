@@ -82,6 +82,7 @@ string formatLastSeen(int64_t lastSeenAt, int64_t now);
 
 /**
  * @brief Removes a saved session file if present.
+ * Throws on unsafe storage or deletion failure; an absent file is a no-op.
  */
 void deleteSession(const string& name);
 

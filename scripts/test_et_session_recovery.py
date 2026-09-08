@@ -9,10 +9,12 @@ import stat
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 
 SCRIPT = Path(__file__).with_name("et-session-recovery.py")
+ROOT_SCRIPT = SCRIPT.with_name("et-session-recovery-root.py")
 SPEC = importlib.util.spec_from_file_location("et_session_recovery", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
 AUDIT = importlib.util.module_from_spec(SPEC)
@@ -26,11 +28,15 @@ BOOTSTRAP_KEY = "bOoTstrap01234567890123456789012"
 
 
 class SessionRecoveryTest(unittest.TestCase):
-    def test_root_failure_diagnostics_do_not_echo_exception_text(self) -> None:
-        source = SCRIPT.with_name("et-session-recovery-root.py")
-        spec = importlib.util.spec_from_file_location("et_root_audit", source)
+    def load_root_helper(self):
+        spec = importlib.util.spec_from_file_location("et_root_audit", ROOT_SCRIPT)
+        assert spec is not None and spec.loader is not None
         helper = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(helper)
+        return helper
+
+    def test_root_failure_diagnostics_do_not_echo_exception_text(self) -> None:
+        helper = self.load_root_helper()
         try:
             raise RuntimeError(f"private source: {CLIENT_ID}/{PASSKEY}")
         except RuntimeError as error:
@@ -40,6 +46,43 @@ class SessionRecoveryTest(unittest.TestCase):
         self.assertFalse(CLIENT_ID in serialized, "client ID leaked")
         self.assertFalse(PASSKEY in serialized, "passkey leaked")
         self.assertFalse(report["raw_diagnostics_recorded"])
+
+    def test_root_helper_requires_explicit_or_valid_sudo_user(self) -> None:
+        helper = self.load_root_helper()
+        for environment in ({}, {"SUDO_USER": "root"}):
+            with self.subTest(environment=environment):
+                with mock.patch.dict(os.environ, environment, clear=True):
+                    with self.assertRaises(helper.AuditError) as raised:
+                        helper._resolve_account(None)
+                self.assertNotIn(PASSKEY, str(raised.exception))
+
+        account = SimpleNamespace(
+            pw_name="alice", pw_uid=501, pw_gid=20, pw_dir="/srv/alice"
+        )
+        with mock.patch.dict(os.environ, {"SUDO_USER": "alice"}, clear=True):
+            with mock.patch.object(
+                helper.pwd, "getpwnam", return_value=account
+            ) as lookup:
+                self.assertIs(helper._resolve_account(None), account)
+        lookup.assert_called_once_with("alice")
+
+        root_account = SimpleNamespace(
+            pw_name="toor", pw_uid=0, pw_gid=0, pw_dir="/root"
+        )
+        with mock.patch.dict(os.environ, {"SUDO_USER": "toor"}, clear=True):
+            with mock.patch.object(helper.pwd, "getpwnam", return_value=root_account):
+                with self.assertRaises(helper.AuditError):
+                    helper._resolve_account(None)
+
+    def test_root_helper_scans_the_selected_account_home(self) -> None:
+        helper = self.load_root_helper()
+        account = SimpleNamespace(pw_dir="/srv/alice")
+        scanner = mock.Mock()
+        scanner.scan_local.return_value.public.return_value = {"scope": "local"}
+        with mock.patch.object(helper, "_load_scanner", return_value=scanner):
+            report = helper._scan_account(account)
+        self.assertEqual(report, {"scope": "local"})
+        scanner.scan_local.assert_called_once_with(home=Path("/srv/alice"))
 
     def test_available_service_state_is_reported_without_raw_output(self) -> None:
         audit = AUDIT.Audit()
@@ -253,6 +296,212 @@ class SessionRecoveryTest(unittest.TestCase):
                     recovery, "recovered", "nas", 2022, CLIENT_ID, PASSKEY
                 )
             self.assertFalse(recovery.exists())
+
+    def test_import_parent_inspection_failures_are_sanitized(self) -> None:
+        for exception in (FileNotFoundError, PermissionError):
+            with self.subTest(exception=exception.__name__):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary).resolve()
+                    parent = root / "parent"
+                    recovery = parent / "new-home"
+                    original_lstat = AUDIT.os.lstat
+
+                    def fake_lstat(path, *, _parent=parent, _error=exception):
+                        if Path(path) == _parent:
+                            raise _error(f"private {CLIENT_ID}/{PASSKEY}")
+                        return original_lstat(path)
+
+                    with mock.patch.object(AUDIT.os, "lstat", side_effect=fake_lstat):
+                        with self.assertRaises(AUDIT.AuditError) as raised:
+                            AUDIT._write_private_record(
+                                recovery,
+                                "recovered",
+                                "nas",
+                                2022,
+                                CLIENT_ID,
+                                PASSKEY,
+                            )
+                    self.assertNotIn(CLIENT_ID, str(raised.exception))
+                    self.assertNotIn(PASSKEY, str(raised.exception))
+
+    def test_failed_record_write_removes_only_new_backup_and_can_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            recovery = Path(temporary).resolve() / "recovery-home"
+            injected = OSError(f"write failed for {CLIENT_ID}/{PASSKEY}")
+            with mock.patch.object(AUDIT.os, "link", side_effect=injected):
+                with self.assertRaises(AUDIT.AuditError) as raised:
+                    AUDIT._write_private_record(
+                        recovery,
+                        "recovered",
+                        "nas",
+                        2022,
+                        CLIENT_ID,
+                        PASSKEY,
+                    )
+            self.assertNotIn(CLIENT_ID, str(raised.exception))
+            self.assertNotIn(PASSKEY, str(raised.exception))
+            backup = recovery / ".et" / "recovery-backups" / "recovered"
+            self.assertFalse(backup.exists())
+
+            AUDIT._write_private_record(
+                recovery,
+                "recovered",
+                "nas",
+                2022,
+                CLIENT_ID,
+                PASSKEY,
+            )
+            record = recovery / ".et" / "sessions" / "recovered"
+            self.assertTrue(record.is_file())
+            self.assertEqual(backup.read_bytes(), record.read_bytes())
+
+    def test_preexisting_record_and_backup_are_not_overwritten(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            recovery = Path(temporary).resolve() / "recovery-home"
+            AUDIT._write_private_record(
+                recovery,
+                "recovered",
+                "nas",
+                2022,
+                CLIENT_ID,
+                PASSKEY,
+            )
+            record = recovery / ".et" / "sessions" / "recovered"
+            backup = recovery / ".et" / "recovery-backups" / "recovered"
+            original_record = record.read_bytes()
+            original_backup = backup.read_bytes()
+
+            with self.assertRaises(AUDIT.AuditError):
+                AUDIT._write_private_record(
+                    recovery,
+                    "recovered",
+                    "other-host",
+                    2023,
+                    "ZyX9876543210987",
+                    "sEcRet987654321098765432109876",
+                )
+
+            self.assertEqual(record.read_bytes(), original_record)
+            self.assertEqual(backup.read_bytes(), original_backup)
+
+    def test_post_link_cleanup_removes_only_our_record_on_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            recovery = Path(temporary).resolve() / "recovery-home"
+            original_unlink = AUDIT.os.unlink
+            calls = []
+
+            def fail_first_unlink(path):
+                calls.append(Path(path))
+                if len(calls) == 1:
+                    raise OSError(f"cleanup failed for {CLIENT_ID}/{PASSKEY}")
+                return original_unlink(path)
+
+            with mock.patch.object(AUDIT.os, "unlink", side_effect=fail_first_unlink):
+                with self.assertRaises(AUDIT.AuditError) as raised:
+                    AUDIT._write_private_record(
+                        recovery,
+                        "recovered",
+                        "nas",
+                        2022,
+                        CLIENT_ID,
+                        PASSKEY,
+                    )
+            self.assertNotIn(CLIENT_ID, str(raised.exception))
+            self.assertNotIn(PASSKEY, str(raised.exception))
+            self.assertFalse((recovery / ".et" / "sessions" / "recovered").exists())
+            self.assertFalse(
+                (recovery / ".et" / "recovery-backups" / "recovered").exists()
+            )
+            self.assertGreaterEqual(len(calls), 3)
+
+    def test_cleanup_failure_reports_possible_private_leftovers_without_secrets(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            recovery = Path(temporary).resolve() / "recovery-home"
+            injected = OSError(f"unlink failed for {CLIENT_ID}/{PASSKEY}")
+            with mock.patch.object(AUDIT.os, "link", side_effect=injected):
+                with mock.patch.object(AUDIT.os, "unlink", side_effect=injected):
+                    with self.assertRaises(AUDIT.AuditError) as raised:
+                        AUDIT._write_private_record(
+                            recovery,
+                            "recovered",
+                            "nas",
+                            2022,
+                            CLIENT_ID,
+                            PASSKEY,
+                        )
+            self.assertIn("private recovery files may remain", str(raised.exception))
+            self.assertNotIn(CLIENT_ID, str(raised.exception))
+            self.assertNotIn(PASSKEY, str(raised.exception))
+
+    def test_temporary_credential_cleanup_failure_is_reported(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            recovery = Path(temporary).resolve() / "recovery-home"
+            original_unlink = AUDIT.os.unlink
+
+            def refuse_temporary(path):
+                if Path(path).name.startswith(".et-recovery-"):
+                    raise OSError(f"cleanup failed for {CLIENT_ID}/{PASSKEY}")
+                return original_unlink(path)
+
+            with mock.patch.object(AUDIT.os, "unlink", side_effect=refuse_temporary):
+                with self.assertRaises(AUDIT.AuditError) as raised:
+                    AUDIT._write_private_record(
+                        recovery, "recovered", "nas", 2022, CLIENT_ID, PASSKEY
+                    )
+            self.assertIn("private recovery files may remain", str(raised.exception))
+            self.assertNotIn(CLIENT_ID, str(raised.exception))
+            self.assertNotIn(PASSKEY, str(raised.exception))
+
+    def test_history_unavailable_entries_are_counted_as_skipped(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            audit = AUDIT.Audit()
+            with mock.patch.object(
+                AUDIT,
+                "_read_regular_file",
+                return_value=(None, "unavailable"),
+            ):
+                AUDIT._scan_histories(Path(temporary), audit)
+            source = audit.public()["sources"]["shell_history"]
+            self.assertEqual(source["files_seen"], len(AUDIT.HISTORY_NAMES))
+            self.assertEqual(source["skipped"], len(AUDIT.HISTORY_NAMES))
+
+    def test_json_import_success_keeps_stdout_valid_json(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            audit = AUDIT.Audit()
+            audit.add_pair(CLIENT_ID, PASSKEY, "local_session_store", "session_store")
+            label = audit.public()["candidates"][0]["label"]
+            output = io.StringIO()
+            errors = io.StringIO()
+            with mock.patch.object(AUDIT, "scan_local", return_value=audit):
+                with mock.patch.object(AUDIT, "import_candidate"):
+                    with (
+                        contextlib.redirect_stdout(output),
+                        contextlib.redirect_stderr(errors),
+                    ):
+                        result = AUDIT.main(
+                            [
+                                "--format",
+                                "json",
+                                "--import-label",
+                                label,
+                                "--write-recovery-record",
+                                "--name",
+                                "recovered",
+                                "--host",
+                                "nas",
+                                "--port",
+                                "2022",
+                                "--recovery-home",
+                                str(Path(temporary).resolve() / "recovery"),
+                            ]
+                        )
+            self.assertEqual(result, 0)
+            self.assertEqual(
+                json.loads(output.getvalue())["summary"]["complete_pairs"], 1
+            )
+            self.assertIn("recovery record", errors.getvalue())
 
     def test_cli_error_does_not_echo_secret(self) -> None:
         output = io.StringIO()

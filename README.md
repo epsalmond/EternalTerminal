@@ -233,6 +233,14 @@ the connection running without a saved record.
 Client disconnection keeps a saved record. An ended remote session removes
 it once the client learns that it ended. A saved record cannot restore a
 remote shell that has exited, including after the server machine reboots.
+Records have no automatic expiry: an old or disconnected session may still
+contain live work. Reattaching removes a record if the server confirms that
+the session has ended. For a record you no longer need, you can remove that
+specific local file after inspecting it; removing a record does not end its
+remote shell and discards your saved reattachment credentials. Do not delete
+the entire sessions directory as routine cleanup. Files rejected for unsafe
+ownership, permissions, or hard links require manual inspection and repair
+or removal; ET will not read or overwrite them to reclaim the name.
 See [session recovery](docs/session-recovery.md) for read-only investigation
 of sessions created before default persistence was available.
 

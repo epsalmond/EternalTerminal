@@ -274,6 +274,54 @@ TEST_CASE("SessionStore delete removes file", "[SessionStore]") {
   deleteSession("alpha");
 }
 
+TEST_CASE("SessionStore reports deletion failures without exposing credentials",
+          "[SessionStore]") {
+  TestEnvironment env;
+  const string home = env.setHomeDir(env.createTempDir());
+  const string directory = home + "/.et/sessions";
+  const string path = directory + "/alpha";
+  const SessionInfo info = makeInfo("alpha");
+  saveSession(info);
+
+  SECTION("unsafe parent is not reported as a successful deletion") {
+    REQUIRE(::chmod(directory.c_str(), 0750) == 0);
+    bool failed = false;
+    try {
+      deleteSession("alpha");
+    } catch (const std::exception& error) {
+      failed = true;
+      CHECK(string(error.what()).find(info.passkey) == string::npos);
+    }
+    REQUIRE(::chmod(directory.c_str(), 0700) == 0);
+    REQUIRE(failed);
+    REQUIRE(loadSession("alpha").has_value());
+  }
+
+  SECTION("unlink permission errors reach the caller") {
+    if (getuid() == 0) {
+      return;  // Root can unlink despite directory permissions.
+    }
+    REQUIRE(::chmod(directory.c_str(), 0500) == 0);
+    bool failed = false;
+    try {
+      deleteSession("alpha");
+    } catch (const std::exception& error) {
+      failed = true;
+      CHECK(string(error.what()).find(info.passkey) == string::npos);
+    }
+    REQUIRE(::chmod(directory.c_str(), 0700) == 0);
+    REQUIRE(failed);
+    REQUIRE(loadSession("alpha").has_value());
+  }
+
+  SECTION("unsafe records are retained with an explicit failure") {
+    REQUIRE(::chmod(path.c_str(), 0640) == 0);
+    REQUIRE_THROWS(deleteSession("alpha"));
+    struct stat fileStat;
+    REQUIRE(::lstat(path.c_str(), &fileStat) == 0);
+  }
+}
+
 TEST_CASE("SessionStore list is sorted and skips corrupt entries",
           "[SessionStore]") {
   TestEnvironment env;

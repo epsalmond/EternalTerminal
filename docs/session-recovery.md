@@ -95,17 +95,18 @@ does not transfer credentials or create local records.
 The isolated home also contains an independent private record copy in
 `.et/recovery-backups`, which survives deletion of the active record.
 
-For the NAS incident, run the staged helper from a root shell:
+For a privileged audit, run the staged helper from a root shell and identify
+the account whose home should be scanned:
 
 ```sh
-python3 -B /home/eric/et-recovery-audit-20260906/et-session-recovery-root.py
+python3 -B /home/eric/et-recovery-audit-20260906/et-session-recovery-root.py --user eric
 ```
 
 It scans the same sources with root read access and writes a redacted report
 to a fresh `/var/tmp/et-root-audit-*/report.json`. The directory is mode
-`0700`, and the report is mode `0600`. Both belong to `eric` so the report can
-be read over SSH. The helper prints the exact report path. It does not
-create recovery records, read process memory, or alter ET processes.
+`0700`, and the report is mode `0600`. Both belong to the selected account so
+the report can be read over SSH. The helper prints the exact report path. It
+does not create recovery records, read process memory, or alter ET processes.
 
 ## September 6, 2026 investigation
 

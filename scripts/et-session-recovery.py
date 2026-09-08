@@ -527,7 +527,7 @@ def _scan_histories(home: Path, audit: Audit) -> None:
         if data is None:
             if status == "permission_denied":
                 source["permission_denied"] += 1
-            if status not in {"unavailable", "symlink_skipped", "permission_denied"}:
+            else:
                 source["skipped"] += 1
             continue
         source["files_read"] += 1
@@ -989,7 +989,8 @@ def _absolute_path(value: str) -> Path:
     return path
 
 
-def _ensure_private_directory(path: Path, create: bool) -> None:
+def _ensure_private_directory(path: Path, create: bool) -> bool:
+    created = False
     try:
         info = os.lstat(path)
     except FileNotFoundError:
@@ -999,7 +1000,11 @@ def _ensure_private_directory(path: Path, create: bool) -> None:
             path.mkdir(mode=0o700)
         except OSError as exc:
             raise AuditError("could not create private recovery directory") from exc
-        info = os.lstat(path)
+        try:
+            info = os.lstat(path)
+        except OSError as exc:
+            raise AuditError("could not inspect recovery directory") from exc
+        created = True
     except OSError as exc:
         raise AuditError("could not inspect recovery directory") from exc
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
@@ -1008,6 +1013,7 @@ def _ensure_private_directory(path: Path, create: bool) -> None:
         raise AuditError("recovery directory is not owner controlled")
     if stat.S_IMODE(info.st_mode) & 0o077:
         raise AuditError("recovery directory is not private")
+    return created
 
 
 def _write_private_record(
@@ -1021,7 +1027,10 @@ def _write_private_record(
     # Reject ancestors that another account could rename while we create the
     # store. Root-owned sticky temporary directories are safe parent locations.
     for ancestor in reversed(recovery_home.parents):
-        info = os.lstat(ancestor)
+        try:
+            info = os.lstat(ancestor)
+        except OSError as exc:
+            raise AuditError("could not inspect recovery parent directory") from exc
         trusted_owner = info.st_uid in {0, os.geteuid()}
         sticky_root = info.st_uid == 0 and bool(info.st_mode & stat.S_ISVTX)
         if (
@@ -1030,98 +1039,195 @@ def _write_private_record(
             or (info.st_mode & 0o022 and not sticky_root)
         ):
             raise AuditError("recovery HOME has an unsafe parent directory")
-    try:
-        os.mkdir(recovery_home, 0o700)
-    except OSError as exc:
-        raise AuditError("recovery HOME must be a new private directory") from exc
-    _ensure_private_directory(recovery_home, False)
-    et_dir = recovery_home / ".et"
-    sessions_dir = et_dir / "sessions"
-    _ensure_private_directory(et_dir, True)
-    _ensure_private_directory(sessions_dir, True)
 
-    target = sessions_dir / name
-    try:
-        target_info = os.lstat(target)
-    except FileNotFoundError:
-        target_info = None
-    except OSError as exc:
-        raise AuditError("could not inspect recovery record") from exc
-    if target_info is not None:
-        raise AuditError("recovery record already exists")
+    created_directories: list[tuple[Path, tuple[int, int]]] = []
+    target = recovery_home / ".et" / "sessions" / name
+    backup_path = recovery_home / ".et" / "recovery-backups" / name
+    backup_created = False
+    backup_identity: Optional[tuple[int, int]] = None
+    record_created = False
+    record_identity: Optional[tuple[int, int]] = None
+    committed = False
+    temporary_cleanup_failed = False
 
-    contents = (
-        "version=1\n"
-        f"name={name}\n"
-        f"host={host}\n"
-        f"port={port}\n"
-        f"id={client_id}\n"
-        f"passkey={passkey}\n"
-        f"savedat={int(time.time())}\n"
-        "title=\n"
-    ).encode("utf-8")
-    # An attach may remove a stale active record. Keep an independent copy.
-    backup_dir = et_dir / "recovery-backups"
-    _ensure_private_directory(backup_dir, True)
-    try:
-        backup_fd = os.open(
-            backup_dir / name,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
-            0o600,
-        )
-        with os.fdopen(backup_fd, "wb") as backup:
-            os.fchmod(backup.fileno(), 0o600)
-            backup.write(contents)
-            backup.flush()
-            os.fsync(backup.fileno())
-    except OSError as exc:
-        raise AuditError("could not write private recovery backup") from exc
-    temporary: Optional[Path] = None
-    fd = -1
-    try:
-        fd, temporary_name = tempfile.mkstemp(
-            prefix=".et-recovery-", dir=str(sessions_dir)
-        )
-        temporary = Path(temporary_name)
-        os.fchmod(fd, 0o600)
-        written = 0
-        while written < len(contents):
-            count = os.write(fd, contents[written:])
-            if count <= 0:
-                raise OSError("record write failed")
-            written += count
-        os.fsync(fd)
-        os.close(fd)
-        fd = -1
-        # Hard-link the complete file into place, so an existing target cannot
-        # be replaced by a race.  The source record is never changed.
-        os.link(temporary, target, follow_symlinks=False)
-        os.unlink(temporary)
-        temporary = None
+    def remember_directory(path: Path) -> None:
         try:
-            directory_fd = os.open(sessions_dir, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            info = os.lstat(path)
         except OSError:
-            # The record is complete even on platforms that do not fsync dirs.
-            pass
-    except FileExistsError as exc:
-        raise AuditError("recovery record already exists") from exc
-    except OSError as exc:
+            return
+        created_directories.append((path, (info.st_dev, info.st_ino)))
+
+    def cleanup_created_state() -> bool:
+        nonlocal backup_created, record_created
+        cleanup_failed = temporary_cleanup_failed
+        if record_created:
+            if record_identity is None:
+                cleanup_failed = True
+            else:
+                try:
+                    info = os.lstat(target)
+                    if (info.st_dev, info.st_ino) == record_identity:
+                        os.unlink(target)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    cleanup_failed = True
+        if backup_created:
+            if backup_identity is None:
+                cleanup_failed = True
+            else:
+                try:
+                    info = os.lstat(backup_path)
+                    if (info.st_dev, info.st_ino) == backup_identity:
+                        os.unlink(backup_path)
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    cleanup_failed = True
+            backup_created = False
+        # Remove only empty directories created by this invocation. This
+        # leaves any pre-existing record, backup, or unrelated user data alone.
+        for path, identity in reversed(created_directories):
+            try:
+                info = os.lstat(path)
+                if (info.st_dev, info.st_ino) != identity or not stat.S_ISDIR(
+                    info.st_mode
+                ):
+                    continue
+                os.rmdir(path)
+            except OSError:
+                pass
+        return cleanup_failed
+
+    try:
+        try:
+            os.mkdir(recovery_home, 0o700)
+        except OSError as exc:
+            raise AuditError("recovery HOME must be a new private directory") from exc
+        else:
+            remember_directory(recovery_home)
+            _ensure_private_directory(recovery_home, False)
+
+        et_dir = recovery_home / ".et"
+        sessions_dir = et_dir / "sessions"
+        if _ensure_private_directory(et_dir, True):
+            remember_directory(et_dir)
+        if _ensure_private_directory(sessions_dir, True):
+            remember_directory(sessions_dir)
+
+        try:
+            target_info = os.lstat(target)
+        except FileNotFoundError:
+            target_info = None
+        except OSError as exc:
+            raise AuditError("could not inspect recovery record") from exc
+        if target_info is not None:
+            raise AuditError("recovery record already exists")
+
+        contents = (
+            "version=1\n"
+            f"name={name}\n"
+            f"host={host}\n"
+            f"port={port}\n"
+            f"id={client_id}\n"
+            f"passkey={passkey}\n"
+            f"savedat={int(time.time())}\n"
+            "title=\n"
+        ).encode("utf-8")
+        # An attach may remove a stale active record. Keep an independent copy.
+        backup_dir = et_dir / "recovery-backups"
+        if _ensure_private_directory(backup_dir, True):
+            remember_directory(backup_dir)
+        backup_fd = -1
+        try:
+            backup_fd = os.open(
+                backup_path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            backup_created = True
+            backup_info = os.fstat(backup_fd)
+            backup_identity = (backup_info.st_dev, backup_info.st_ino)
+            with os.fdopen(backup_fd, "wb") as backup:
+                backup_fd = -1
+                os.fchmod(backup.fileno(), 0o600)
+                backup.write(contents)
+                backup.flush()
+                os.fsync(backup.fileno())
+        except FileExistsError as exc:
+            raise AuditError("recovery backup already exists") from exc
+        except Exception as exc:
+            raise AuditError("could not write private recovery backup") from exc
+        finally:
+            if backup_fd >= 0:
+                try:
+                    os.close(backup_fd)
+                except OSError:
+                    pass
+
+        temporary: Optional[Path] = None
+        fd = -1
+        try:
+            fd, temporary_name = tempfile.mkstemp(
+                prefix=".et-recovery-", dir=str(sessions_dir)
+            )
+            temporary = Path(temporary_name)
+            os.fchmod(fd, 0o600)
+            written = 0
+            while written < len(contents):
+                count = os.write(fd, contents[written:])
+                if count <= 0:
+                    raise OSError("record write failed")
+                written += count
+            os.fsync(fd)
+            os.close(fd)
+            fd = -1
+            # Hard-link the complete file into place, so an existing target cannot
+            # be replaced by a race. The source record is never changed.
+            os.link(temporary, target, follow_symlinks=False)
+            record_created = True
+            try:
+                record_info = os.lstat(target)
+                record_identity = (record_info.st_dev, record_info.st_ino)
+            except OSError as exc:
+                raise AuditError("could not inspect private recovery record") from exc
+            os.unlink(temporary)
+            temporary = None
+            try:
+                directory_fd = os.open(sessions_dir, os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+            except OSError:
+                # The record is complete even on platforms that do not fsync dirs.
+                pass
+        except FileExistsError as exc:
+            raise AuditError("recovery record already exists") from exc
+        except Exception as exc:
+            raise AuditError("could not write private recovery record") from exc
+        finally:
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+            if temporary is not None:
+                try:
+                    os.unlink(temporary)
+                except OSError:
+                    temporary_cleanup_failed = True
+        committed = True
+    except AuditError:
+        raise
+    except Exception as exc:
         raise AuditError("could not write private recovery record") from exc
     finally:
-        if fd >= 0:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-        if temporary is not None:
-            try:
-                os.unlink(temporary)
-            except OSError:
-                pass
+        if not committed:
+            if cleanup_created_state():
+                raise AuditError(
+                    "private recovery files may remain after cleanup failure"
+                )
 
 
 def import_candidate(
@@ -1309,7 +1415,10 @@ def main(argv: Optional[list[str]] = None) -> int:
                 allow_unverified_bootstrap=args.allow_unverified_bootstrap,
             )
             # Report success without printing a target path or any credential.
-            print(f"recovery record and private backup created for {args.import_label}")
+            print(
+                f"recovery record and private backup created for {args.import_label}",
+                file=sys.stderr if args.format == "json" else sys.stdout,
+            )
         return 0
     except AuditError as exc:
         # Keep the error vocabulary intentionally generic; source paths and
