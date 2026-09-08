@@ -96,10 +96,12 @@ done
 
 printf 'S_ONE=first\n' >&11
 printf 'S_TWO=second\n' >&12
-printf 'echo READY-ONE\n' >&11
-printf 'echo READY-TWO\n' >&12
-wait_for_grep 'READY-ONE' "$LOG_DIR/client_one.log" 30
-wait_for_grep 'READY-TWO' "$LOG_DIR/client_two.log" 30
+# Only the remote shell can expand these sentinels. Matching echoed input
+# would let the router restart before either shell has actually initialized.
+printf 'echo READY-ONE-$S_ONE\n' >&11
+printf 'echo READY-TWO-$S_TWO\n' >&12
+wait_for_grep 'READY-ONE-first' "$LOG_DIR/client_one.log" 30
+wait_for_grep 'READY-TWO-second' "$LOG_DIR/client_two.log" 30
 
 pids_before=$(terminal_pids)
 [ -n "$pids_before" ] || {
