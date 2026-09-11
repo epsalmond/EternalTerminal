@@ -43,9 +43,33 @@ IdKeyPair UserTerminalRouter::acceptNewConnection() {
     const bool inserted =
         idInfoMap.insert(std::make_pair(tui.id(), tui)).second;
     if (!inserted) {
-      LOG(ERROR) << "Rejecting duplicate terminal connection for " << tui.id();
-      socketHandler->close(terminalFd);
-      return IdKeyPair({"", ""});
+      const string& existingKey = idInfoMap.at(tui.id()).passkey();
+      const string& incomingKey = tui.passkey();
+      if (existingKey.size() != incomingKey.size() ||
+          sodium_memcmp(existingKey.data(), incomingKey.data(),
+                        existingKey.size()) != 0) {
+        LOG(ERROR)
+            << "Rejecting terminal replacement with mismatched credentials";
+        socketHandler->close(terminalFd);
+        return IdKeyPair({"", ""});
+      }
+      // A registration for this id already exists.  If the previous owner's
+      // pipe is dead (the connection dropped without the session ending),
+      // replace it so the terminal can re-attach; a live owner always wins.
+      // MSG_PEEK tests for EOF without consuming terminal data.
+      char peek;
+      const int alive = recv(idInfoMap.at(tui.id()).fd(), &peek, 1, MSG_PEEK);
+      if (alive == 0) {
+        LOG(INFO) << "Replacing dead terminal registration for " << tui.id();
+        socketHandler->close(idInfoMap.at(tui.id()).fd());
+        idInfoMap.erase(tui.id());
+        idInfoMap.insert(std::make_pair(tui.id(), tui));
+      } else {
+        LOG(ERROR) << "Rejecting duplicate terminal connection for "
+                   << tui.id();
+        socketHandler->close(terminalFd);
+        return IdKeyPair({"", ""});
+      }
     }
 
     return IdKeyPair({tui.id(), tui.passkey()});
@@ -64,7 +88,7 @@ std::optional<TerminalUserInfo> UserTerminalRouter::tryGetInfoForConnection(
   lock_guard<recursive_mutex> guard(routerMutex);
   auto it = idInfoMap.find(serverClientState->getId());
   if (it == idInfoMap.end()) {
-    STFATAL << " Tried to read from an id that no longer exists";
+    return std::nullopt;
   }
 
   // While both the id and passkey are randomly generated, do an extra
@@ -76,6 +100,46 @@ std::optional<TerminalUserInfo> UserTerminalRouter::tryGetInfoForConnection(
   }
 
   return it->second;
+}
+
+bool UserTerminalRouter::isPtyActive(const string& id) {
+  lock_guard<recursive_mutex> guard(routerMutex);
+  auto it = idInfoMap.find(id);
+  return it != idInfoMap.end() && it->second.ptyactive();
+}
+
+bool UserTerminalRouter::isCurrentRegistration(const string& id,
+                                               int terminalFd) const {
+  lock_guard<recursive_mutex> guard(routerMutex);
+  const auto it = idInfoMap.find(id);
+  return it != idInfoMap.end() && it->second.fd() == terminalFd;
+}
+
+bool UserTerminalRouter::removeTerminal(const string& id, int terminalFd) {
+  lock_guard<recursive_mutex> guard(routerMutex);
+  auto it = idInfoMap.find(id);
+  if (it == idInfoMap.end() || it->second.fd() != terminalFd) {
+    return false;
+  }
+  socketHandler->close(terminalFd);
+  idInfoMap.erase(it);
+  return true;
+}
+
+void UserTerminalRouter::shutdown() {
+  lock_guard<recursive_mutex> guard(routerMutex);
+  LOG(INFO) << "Router shutdown: closing " << idInfoMap.size()
+            << " terminal pipes";
+  for (auto& it : idInfoMap) {
+    socketHandler->close(it.second.fd());
+  }
+  idInfoMap.clear();
+  if (serverFd >= 0) {
+    // Listen fds are not tracked by the socket handler's active-socket map;
+    // close it directly.
+    ::close(serverFd);
+    serverFd = -1;
+  }
 }
 
 }  // namespace et

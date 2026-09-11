@@ -469,12 +469,16 @@ add_library(
   src/terminal/UserTerminalRouter.cpp
   src/terminal/TerminalClient.hpp
   src/terminal/TerminalClient.cpp
+  src/terminal/TitleParser.hpp
+  src/terminal/TitleParser.cpp
   src/terminal/ServerFifoPath.hpp
   src/terminal/ServerFifoPath.cpp
   src/terminal/SshSetupHandler.hpp
   src/terminal/SshSetupHandler.cpp
   src/terminal/UserTerminalHandler.hpp
   src/terminal/UserTerminalHandler.cpp
+  src/terminal/SessionStore.hpp
+  src/terminal/SessionStore.cpp
   src/terminal/UserJumphostHandler.hpp
   src/terminal/UserJumphostHandler.cpp
   src/terminal/TelemetryService.hpp
@@ -620,9 +624,30 @@ else(WIN32)
       TEST_PREFIX "et-test."
       WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
       ADD_TAGS_AS_LABELS
-      PROPERTIES TIMEOUT 300
+      # The router-restart integration tests spin up full client/server/terminal
+      # stacks (one with 14 concurrent sessions) and need wall-clock headroom on
+      # a loaded CI runner.
+      PROPERTIES TIMEOUT 900
     )
     add_sanitizers(et-test)
+    if(NOT WIN32)
+      find_package(Python3 3.9 QUIET COMPONENTS Interpreter)
+      if(Python3_Interpreter_FOUND)
+        add_test(
+          NAME et-recovery-audit
+          COMMAND ${Python3_EXECUTABLE} -B -m unittest discover
+                  -s ${CMAKE_CURRENT_SOURCE_DIR}/scripts
+                  -p test_et_session_recovery.py)
+        add_test(
+          NAME et-default-persistence-cli
+          COMMAND ${Python3_EXECUTABLE} -B
+                  ${CMAKE_CURRENT_SOURCE_DIR}/test/system_tests/test_default_persistence.py)
+        set_tests_properties(et-recovery-audit PROPERTIES TIMEOUT 30)
+        set_tests_properties(et-default-persistence-cli PROPERTIES
+          TIMEOUT 180
+          ENVIRONMENT "ET_BUILD_DIR=${CMAKE_CURRENT_BINARY_DIR}")
+      endif()
+    endif()
     if(TARGET test)
       add_dependencies(test et-test)
     endif()
