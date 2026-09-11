@@ -42,6 +42,8 @@ class DefaultPersistenceCliTest(unittest.TestCase):
         self.env = os.environ.copy()
         self.env.update(
             HOME=str(self.home),
+            # PseudoUserTerminal reads SHELL when launching the fixture PTY.
+            SHELL="/bin/sh",
             TERM="xterm-256color",
             PATH=str(self.fake_bin) + os.pathsep + os.environ.get("PATH", ""),
         )
