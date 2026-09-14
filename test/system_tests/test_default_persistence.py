@@ -253,6 +253,8 @@ class DefaultPersistenceCliTest(unittest.TestCase):
             {r["name"] for r in records}, {p.name for p in self._session_paths()}
         )
         self.assertEqual(len({r["name"] for r in records}), 2)
+        for record in records:
+            self.assertRegex(record["name"], r"^[0-9]{8}-[A-Za-z0-9]{4}$")
         self._assert_credentials_hidden(self._finish_client(first, True), records)
         self._assert_credentials_hidden(self._finish_client(second, True), records)
 
@@ -268,6 +270,41 @@ class DefaultPersistenceCliTest(unittest.TestCase):
         self.assertEqual(marker.read_text(), "connected")
         self._assert_credentials_hidden(output, records)
         self.assertEqual(len(self._records()), 2)
+
+    def test_list_separates_columns_after_long_name(self):
+        long_name = "n" * 63
+        ready = self.workspace / "long-name-ready"
+        client = self._start_client(
+            "-e",
+            "--name",
+            long_name,
+            "-c",
+            "touch " + str(ready),
+        )
+        self._wait(
+            lambda: len(self._records()) == 1 and ready.is_file(),
+            "long named session",
+        )
+
+        listing = subprocess.run(
+            [str(self.et), "--telemetry=false", "--list"],
+            env=self.env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            errors="replace",
+            check=False,
+        )
+        self.assertEqual(listing.returncode, 0)
+        rows = [
+            line for line in listing.stdout.splitlines() if line.startswith(long_name)
+        ]
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertIn(long_name + " -", row)
+        self._assert_credentials_hidden(listing.stdout, self._records())
+        self._finish_client(client, True)
 
     def test_attach_survives_client_and_server_restart_then_removes_record(self):
         ready = self.workspace / "restart-ready"

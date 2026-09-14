@@ -153,7 +153,8 @@ user-supplied evidence; this investigation did not repeat that attach.
 ## Persistence validation
 
 The updated client saves direct-session credentials before connection setup.
-It assigns a generated name unless `--name` or `--no-persist` is supplied.
+It assigns a generated `YYYYMMDD-xxxx` name unless `--name` or `--no-persist`
+is supplied.
 New records use atomic creation that refuses to replace an existing record.
 The store synchronizes credential files and directory entries to disk.
 

@@ -144,7 +144,7 @@ default_count=$(find "$TEST_HOME/.et/sessions" -maxdepth 1 -type f | wc -l | tr 
   echo "ordinary session did not create exactly one saved session" >&2
   exit 1
 }
-HOME=$TEST_HOME build/et --list | grep -E -q '^localhost-20[0-9]{6}-[0-9]{6}-[[:alnum:]]{4}'
+HOME=$TEST_HOME build/et --list | grep -E -q '^20[0-9]{6}-[[:alnum:]]{4}'
 kill -9 "$aux_pid" 2>/dev/null || true
 wait "$aux_pid" 2>/dev/null || true
 aux_pid=""
