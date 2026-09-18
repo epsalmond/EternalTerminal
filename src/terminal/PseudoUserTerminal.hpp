@@ -124,13 +124,21 @@ class PseudoUserTerminal : public UserTerminal {
     }
 #if __NetBSD__  // this unfortunateness seems to be fixed in NetBSD-8 (or at
                 // least -CURRENT) sadness for now :/
-    int throwaway;
+    int status = 0;
     pid_t waitResult;
     do {
-      waitResult = waitpid(getPid(), &throwaway, 0);
+      waitResult = waitpid(getPid(), &status, 0);
     } while (waitResult == -1 && errno == EINTR);
     if (waitResult == getPid()) {
       childReaped = true;
+      if (WIFEXITED(status)) {
+        LOG(INFO) << "Shell pid " << getPid() << " exited with status "
+                  << WEXITSTATUS(status);
+      } else if (WIFSIGNALED(status)) {
+        LOG(INFO) << "Shell pid " << getPid() << " killed by signal "
+                  << WTERMSIG(status) << " (" << strsignal(WTERMSIG(status))
+                  << ")";
+      }
     } else if (waitResult == -1 && errno == ECHILD) {
       childReaped = true;
       LOG(ERROR) << "waitpid failed, child already reaped.";
@@ -153,6 +161,24 @@ class PseudoUserTerminal : public UserTerminal {
       }
     } else {
       childReaped = true;
+      switch (childInfo.si_code) {
+        case CLD_EXITED:
+          LOG(INFO) << "Shell pid " << getPid() << " exited with status "
+                    << childInfo.si_status;
+          break;
+        case CLD_KILLED:
+        case CLD_DUMPED:
+          LOG(INFO) << "Shell pid " << getPid() << " killed by signal "
+                    << childInfo.si_status << " ("
+                    << strsignal(childInfo.si_status) << ")"
+                    << (childInfo.si_code == CLD_DUMPED ? ", core dumped"
+                                                        : "");
+          break;
+        default:
+          LOG(INFO) << "Shell pid " << getPid() << " ended with si_code "
+                    << childInfo.si_code << " status " << childInfo.si_status;
+          break;
+      }
     }
 #endif
   }
