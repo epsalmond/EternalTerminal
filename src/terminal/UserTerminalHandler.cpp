@@ -262,6 +262,10 @@ void UserTerminalHandler::runUserTerminal(int masterFd) {
               shuttingDown = true;
               break;
             }
+            // A client attaching (or resizing) sends terminal info; log it so
+            // attach events line up with the shell's end in this log.
+            LOG(INFO) << "Got terminal info: " << ti.row() << "x"
+                      << ti.column();
             winsize tmpwin;
             tmpwin.ws_row = ti.row();
             tmpwin.ws_col = ti.column();
